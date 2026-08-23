@@ -4,8 +4,8 @@ import { useDocStore } from '../store/documentStore'
 import { useTitleBarDrag } from '../hooks/useTitleBarDrag'
 import { rgbToHex } from '../color/colorMath'
 import {
-  buildImageTracerOptions,
   buildPlacementMatrix,
+  buildVtracerOptions,
   decodeImageData,
   defaultTraceUiOptions,
   parseTracedSvg,
@@ -17,7 +17,7 @@ import { IconButton } from './Icon'
 
 const TRACE_DEBOUNCE_MS = 300
 
-/** Draggable modal: tune imagetracerjs options against a live worker-rendered preview. */
+/** Draggable modal: tune vtracer options against a live worker-rendered preview. */
 export function SvgTraceDialog() {
   const nodeId = useDocStore((s) => s.svgTraceNodeId)
   const setSvgTraceNodeId = useDocStore((s) => s.setSvgTraceNodeId)
@@ -95,7 +95,7 @@ export function SvgTraceDialog() {
     if (!client) return
     setBusy(true)
     setError(null)
-    const { requestId, result } = client.trace(buildImageTracerOptions(uiRef.current))
+    const { requestId, result } = client.trace(buildVtracerOptions(uiRef.current))
     latestRequestId.current = requestId
     result
       .then((svg) => {
@@ -205,34 +205,65 @@ export function SvgTraceDialog() {
             <div className="svg-trace-modal__group">
               <h3 className="svg-trace-modal__group-title">Color</h3>
               <label className="field-inline">
-                <span>Colors</span>
+                <span>Precision</span>
                 <input
                   type="range"
-                  min={2}
-                  max={48}
+                  min={1}
+                  max={8}
                   step={1}
-                  value={ui.numberOfColors}
+                  value={ui.colorPrecision}
                   onChange={(e) =>
-                    setUi((u) => ({ ...u, numberOfColors: Number(e.target.value) }))
+                    setUi((u) => ({ ...u, colorPrecision: Number(e.target.value) }))
                   }
                 />
-                <em className="field-inline__val">{ui.numberOfColors}</em>
+                <em className="field-inline__val">{ui.colorPrecision}</em>
+              </label>
+              <label className="field-inline">
+                <span>Mode</span>
+                <select
+                  value={ui.clustering}
+                  onChange={(e) =>
+                    setUi((u) => ({
+                      ...u,
+                      clustering: e.target.value as TraceUiOptions['clustering'],
+                    }))
+                  }
+                >
+                  <option value="color-cluster">Color cluster</option>
+                  <option value="bw">Black &amp; white</option>
+                  <option value="watershed">Watershed</option>
+                </select>
               </label>
             </div>
 
             <div className="svg-trace-modal__group">
               <h3 className="svg-trace-modal__group-title">Shape</h3>
               <label className="field-inline">
-                <span>{ui.splitDetail ? 'Curves' : 'Detail'}</span>
+                <span>Fit</span>
+                <select
+                  value={ui.mode}
+                  onChange={(e) =>
+                    setUi((u) => ({ ...u, mode: e.target.value as TraceUiOptions['mode'] }))
+                  }
+                >
+                  <option value="spline">Curves</option>
+                  <option value="polygon">Polygon</option>
+                  <option value="pixel">Pixel</option>
+                </select>
+              </label>
+              <label className="field-inline">
+                <span>Corners</span>
                 <input
                   type="range"
-                  min={0.1}
-                  max={10}
-                  step={0.1}
-                  value={ui.detail}
-                  onChange={(e) => setUi((u) => ({ ...u, detail: Number(e.target.value) }))}
+                  min={0}
+                  max={180}
+                  step={1}
+                  value={ui.cornerThreshold}
+                  onChange={(e) =>
+                    setUi((u) => ({ ...u, cornerThreshold: Number(e.target.value) }))
+                  }
                 />
-                <em className="field-inline__val">{ui.detail.toFixed(1)}</em>
+                <em className="field-inline__val">{ui.cornerThreshold}°</em>
               </label>
               <label className="field-inline">
                 <span>Ignore</span>
@@ -241,76 +272,75 @@ export function SvgTraceDialog() {
                   min={0}
                   max={64}
                   step={1}
-                  value={ui.pathOmit}
-                  onChange={(e) => setUi((u) => ({ ...u, pathOmit: Number(e.target.value) }))}
-                />
-                <em className="field-inline__val">{ui.pathOmit}px</em>
-              </label>
-              <label className="svg-trace-modal__checkbox">
-                <input
-                  type="checkbox"
-                  checked={ui.rightAngleEnhance}
+                  value={ui.filterSpeckle}
                   onChange={(e) =>
-                    setUi((u) => ({ ...u, rightAngleEnhance: e.target.checked }))
+                    setUi((u) => ({ ...u, filterSpeckle: Number(e.target.value) }))
                   }
                 />
-                <span>Enhance right angles</span>
+                <em className="field-inline__val">{ui.filterSpeckle}px</em>
               </label>
             </div>
 
             <div className="svg-trace-modal__group">
               <h3 className="svg-trace-modal__group-title">Cleanup</h3>
               <label className="field-inline">
-                <span>Blur</span>
+                <span>Simplify</span>
                 <input
                   type="range"
                   min={0}
-                  max={5}
-                  step={1}
-                  value={ui.blurRadius}
-                  onChange={(e) => setUi((u) => ({ ...u, blurRadius: Number(e.target.value) }))}
+                  max={2.5}
+                  step={0.1}
+                  value={ui.simplify}
+                  onChange={(e) => setUi((u) => ({ ...u, simplify: Number(e.target.value) }))}
                 />
-                <em className="field-inline__val">{ui.blurRadius}</em>
+                <em className="field-inline__val">{ui.simplify === 0 ? 'off' : ui.simplify.toFixed(1)}</em>
               </label>
             </div>
 
             <details className="svg-trace-modal__group svg-trace-modal__group--advanced">
               <summary>Advanced</summary>
               <label className="field-inline">
-                <span>Palette</span>
-                <select
-                  value={ui.colorSampling}
-                  onChange={(e) =>
-                    setUi((u) => ({ ...u, colorSampling: Number(e.target.value) }))
-                  }
-                >
-                  <option value={2}>Perceptual</option>
-                  <option value={0}>Deterministic</option>
-                  <option value={1}>Random</option>
-                </select>
-              </label>
-              <label className="svg-trace-modal__checkbox">
+                <span>Gradient step</span>
                 <input
-                  type="checkbox"
-                  checked={ui.splitDetail}
-                  onChange={(e) => setUi((u) => ({ ...u, splitDetail: e.target.checked }))}
+                  type="range"
+                  min={0}
+                  max={255}
+                  step={1}
+                  value={ui.layerDifference}
+                  onChange={(e) =>
+                    setUi((u) => ({ ...u, layerDifference: Number(e.target.value) }))
+                  }
                 />
-                <span>Separate corner detail</span>
+                <em className="field-inline__val">{ui.layerDifference}</em>
               </label>
-              {ui.splitDetail && (
-                <label className="field-inline">
-                  <span>Corners</span>
-                  <input
-                    type="range"
-                    min={0.1}
-                    max={10}
-                    step={0.1}
-                    value={ui.detailQ}
-                    onChange={(e) => setUi((u) => ({ ...u, detailQ: Number(e.target.value) }))}
-                  />
-                  <em className="field-inline__val">{ui.detailQ.toFixed(1)}</em>
-                </label>
-              )}
+              <label className="field-inline">
+                <span>Segment length</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={20}
+                  step={0.5}
+                  value={ui.lengthThreshold}
+                  onChange={(e) =>
+                    setUi((u) => ({ ...u, lengthThreshold: Number(e.target.value) }))
+                  }
+                />
+                <em className="field-inline__val">{ui.lengthThreshold}px</em>
+              </label>
+              <label className="field-inline">
+                <span>Splice angle</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={180}
+                  step={1}
+                  value={ui.spliceThreshold}
+                  onChange={(e) =>
+                    setUi((u) => ({ ...u, spliceThreshold: Number(e.target.value) }))
+                  }
+                />
+                <em className="field-inline__val">{ui.spliceThreshold}°</em>
+              </label>
               <label className="field-inline">
                 <span>Stroke</span>
                 <input
@@ -322,20 +352,6 @@ export function SvgTraceDialog() {
                   onChange={(e) => setUi((u) => ({ ...u, strokeWidth: Number(e.target.value) }))}
                 />
                 <em className="field-inline__val">{ui.strokeWidth}</em>
-              </label>
-              <label className="field-inline">
-                <span>Passes</span>
-                <input
-                  type="range"
-                  min={1}
-                  max={10}
-                  step={1}
-                  value={ui.colorQuantCycles}
-                  onChange={(e) =>
-                    setUi((u) => ({ ...u, colorQuantCycles: Number(e.target.value) }))
-                  }
-                />
-                <em className="field-inline__val">{ui.colorQuantCycles}</em>
               </label>
             </details>
           </div>

@@ -1,56 +1,75 @@
-import type { ImageTracerOptions } from 'imagetracerjs'
+import { hexToRgb } from '../color/colorMath'
 import type { ImageNode } from '../types'
 
-/** UI-facing trace options — mapped onto imagetracerjs's option object. */
+/** Options accepted by the vendored vtracer wasm binding (see src/vendor/vtracer-wasm). */
+export type VtracerOptions = {
+  clustering?: 'color-cluster' | 'bw' | 'watershed'
+  hierarchical?: 'stacked' | 'cutout'
+  mode?: 'pixel' | 'polygon' | 'spline'
+  filterSpeckle?: number
+  colorPrecision?: number
+  layerDifference?: number
+  cornerThreshold?: number
+  lengthThreshold?: number
+  maxIterations?: number
+  spliceThreshold?: number
+  simplify?: number
+  pathPrecision?: number
+  palette?: string[]
+  maxColors?: number
+  optimize?: number
+  binaryThreshold?: number
+  adaptive?: boolean
+  adaptiveWindow?: number
+  adaptiveT?: number
+  watershedDetail?: number
+  preset?: 'bw' | 'poster' | 'photo'
+}
+
+/** UI-facing trace options — mapped onto vtracer's option object. */
 export type TraceUiOptions = {
-  numberOfColors: number
-  detail: number
-  splitDetail: boolean
-  detailQ: number
-  pathOmit: number
-  blurRadius: number
-  rightAngleEnhance: boolean
-  colorSampling: number
+  mode: 'pixel' | 'polygon' | 'spline'
+  colorPrecision: number
+  filterSpeckle: number
+  cornerThreshold: number
+  simplify: number
+  clustering: 'color-cluster' | 'bw' | 'watershed'
+  layerDifference: number
+  lengthThreshold: number
+  spliceThreshold: number
   strokeWidth: number
-  colorQuantCycles: number
 }
 
 export function defaultTraceUiOptions(): TraceUiOptions {
   return {
-    numberOfColors: 12,
-    detail: 1,
-    splitDetail: false,
-    detailQ: 1,
-    pathOmit: 8,
-    blurRadius: 0,
-    rightAngleEnhance: true,
-    colorSampling: 2,
+    mode: 'spline',
+    colorPrecision: 6,
+    filterSpeckle: 4,
+    cornerThreshold: 60,
+    simplify: 0,
+    clustering: 'color-cluster',
+    layerDifference: 16,
+    lengthThreshold: 4,
+    spliceThreshold: 45,
     strokeWidth: 1,
-    colorQuantCycles: 3,
   }
 }
 
-export function buildImageTracerOptions(ui: TraceUiOptions): ImageTracerOptions {
+export function buildVtracerOptions(ui: TraceUiOptions): VtracerOptions {
   return {
-    numberofcolors: ui.numberOfColors,
-    ltres: ui.detail,
-    qtres: ui.splitDetail ? ui.detailQ : ui.detail,
-    pathomit: ui.pathOmit,
-    blurradius: ui.blurRadius,
-    blurdelta: 20,
-    rightangleenhance: ui.rightAngleEnhance,
-    colorsampling: ui.colorSampling,
-    strokewidth: ui.strokeWidth,
-    colorquantcycles: ui.colorQuantCycles,
-    mincolorratio: 0,
-    linefilter: false,
-    roundcoords: 1,
-    // Fixed: our own placement matrix handles scale/rotation; sequential
-    // layering (0) is required for the hole/compound-path structure below.
-    scale: 1,
-    viewbox: true,
-    layering: 0,
-    desc: false,
+    mode: ui.mode,
+    colorPrecision: ui.colorPrecision,
+    filterSpeckle: ui.filterSpeckle,
+    cornerThreshold: ui.cornerThreshold,
+    simplify: ui.simplify > 0 ? ui.simplify : undefined,
+    clustering: ui.clustering,
+    layerDifference: ui.layerDifference,
+    lengthThreshold: ui.lengthThreshold,
+    spliceThreshold: ui.spliceThreshold,
+    // Force absolute, unabbreviated path commands (M/L/C/Z only) — parseTracedSvg
+    // and transformPathD don't handle vtracer's optimized output (relative
+    // lowercase commands, H/V shorthands).
+    optimize: 0,
   }
 }
 
@@ -100,7 +119,7 @@ export class SvgTraceWorkerClient {
   }
 
   /** Synchronous requestId so callers can discard stale in-flight results. */
-  trace(options: ImageTracerOptions): { requestId: number; result: Promise<string> } {
+  trace(options: VtracerOptions): { requestId: number; result: Promise<string> } {
     const requestId = ++this.nextRequestId
     const result = new Promise<string>((resolve, reject) => {
       this.pending.set(requestId, { kind: 'trace', resolve, reject })
@@ -123,20 +142,18 @@ export type ParsedTracePath = {
   opacity: number
 }
 
-const RGB_RE = /rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/
-
-/** Extract {d, color, opacity} per traced region from imagetracerjs's SVG output. */
+/** Extract {d, color, opacity} per traced region from vtracer's SVG output (fill="#rrggbb"). */
 export function parseTracedSvg(svg: string): ParsedTracePath[] {
   const doc = new DOMParser().parseFromString(svg, 'image/svg+xml')
   const out: ParsedTracePath[] = []
   for (const el of Array.from(doc.querySelectorAll('path'))) {
     const d = el.getAttribute('d')
     if (!d) continue
-    const match = RGB_RE.exec(el.getAttribute('fill') ?? '')
-    if (!match) continue
+    const rgb = hexToRgb(el.getAttribute('fill') ?? '')
+    if (!rgb) continue
     const opacityAttr = el.getAttribute('opacity')
     const opacity = opacityAttr !== null ? Math.max(0, Math.min(1, Number(opacityAttr))) : 1
-    out.push({ d, r: Number(match[1]), g: Number(match[2]), b: Number(match[3]), opacity })
+    out.push({ d, r: rgb.r, g: rgb.g, b: rgb.b, opacity })
   }
   return out
 }
@@ -144,7 +161,7 @@ export function parseTracedSvg(svg: string): ParsedTracePath[] {
 export type PlacementXform = (x: number, y: number) => readonly [number, number]
 
 /**
- * Maps imagetracerjs's native-pixel-space coordinates onto the document,
+ * Maps vtracer's native-pixel-space coordinates onto the document,
  * matching the ImageNode's box/rotation exactly. Uses a single uniform scale
  * + centering offset (not independent x/y scale) to reproduce the browser's
  * `preserveAspectRatio="xMidYMid meet"` behavior used to render/export the
@@ -176,9 +193,13 @@ export function buildPlacementMatrix(
   }
 }
 
-const PATH_COMMAND_RE = /([MLQZ])([^MLQZ]*)/gi
+const PATH_COMMAND_RE = /([MLCZ])([^MLCZ]*)/gi
 
-/** Rewrites every coordinate in a `d` string (M/L/Q/Z only) through `xform`. */
+/**
+ * Rewrites every coordinate in a `d` string through `xform`. Handles only
+ * M/L/C/Z — the commands vtracer emits with `optimize: 0` (absolute,
+ * unabbreviated: no relative lowercase commands, no H/V shorthand).
+ */
 export function transformPathD(d: string, xform: PlacementXform): string {
   let out = ''
   PATH_COMMAND_RE.lastIndex = 0
@@ -199,11 +220,12 @@ export function transformPathD(d: string, xform: PlacementXform): string {
         const [x, y] = xform(nums[i]!, nums[i + 1]!)
         out += `${i === 0 ? cmd : 'L'} ${x} ${y} `
       }
-    } else if (cmd === 'Q') {
-      for (let i = 0; i + 3 < nums.length; i += 4) {
+    } else if (cmd === 'C') {
+      for (let i = 0; i + 5 < nums.length; i += 6) {
         const [cx1, cy1] = xform(nums[i]!, nums[i + 1]!)
-        const [x, y] = xform(nums[i + 2]!, nums[i + 3]!)
-        out += `Q ${cx1} ${cy1} ${x} ${y} `
+        const [cx2, cy2] = xform(nums[i + 2]!, nums[i + 3]!)
+        const [x, y] = xform(nums[i + 4]!, nums[i + 5]!)
+        out += `C ${cx1} ${cy1} ${cx2} ${cy2} ${x} ${y} `
       }
     }
   }
