@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
-import { nodeBBox, parentOf, selectionBBox } from '../geometry'
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { buildParentIndex, nodeBBox, selectionBBox } from '../geometry'
 import { useDocStore } from '../store/documentStore'
 import { snapResizeBBox } from './snap'
 import { isCreateTool } from './NodeViews'
+import type { BBox } from '../types'
 
 type Handle = 'nw' | 'ne' | 'sw' | 'se' | 'n' | 'e' | 's' | 'w' | 'rotate'
 
@@ -14,6 +15,8 @@ type DragState = {
   originRotation: number
   startPointerAngle: number
   svg: SVGSVGElement
+  /** Other nodes' bboxes, cached at drag-start (see geometry.ts buildParentIndex). */
+  others: BBox[]
 }
 
 function svgLocalFromClient(
@@ -81,6 +84,11 @@ export function SelectionOverlay({
   // selection chrome that mounts after the first click.
   const [interactive, setInteractive] = useState(false)
 
+  // Memoized: unioning a large group's children is real work, and doc only
+  // changes reference on actual mutations (post NodeView/PaintedShape memo
+  // fix), so this now only recomputes on real selection/doc changes.
+  const box = useMemo(() => selectionBBox(selectedIds, doc), [selectedIds, doc])
+
   useEffect(() => {
     setInteractive(false)
     const t = window.setTimeout(() => setInteractive(true), 280)
@@ -97,7 +105,7 @@ export function SelectionOverlay({
       const dy = local.y - d.startLocalY
 
       if (d.kind === 'move') {
-        moveSelectedTo(d.originBox.x + dx, d.originBox.y + dy)
+        moveSelectedTo(d.originBox.x + dx, d.originBox.y + dy, d.others)
         return
       }
 
@@ -152,17 +160,8 @@ export function SelectionOverlay({
         top: kind.includes('n'),
         bottom: kind.includes('s'),
       }
-      const state = useDocStore.getState()
-      const liveDoc = state.doc
-      const liveSelected = state.selectedIds
-      const others = Object.values(liveDoc.nodes)
-        .filter(
-          (n) =>
-            n.visible &&
-            !liveSelected.includes(n.id) &&
-            !parentOf(n.id, liveDoc),
-        )
-        .map((n) => nodeBBox(n, liveDoc))
+      const liveDoc = useDocStore.getState().doc
+      const others = d.others
       const snapped = snapResizeBBox(
         { x, y, width, height },
         edges,
@@ -221,7 +220,6 @@ export function SelectionOverlay({
   if (tool !== 'select' && tool !== 'text' && tool !== 'area-text' && !isCreateTool(tool)) {
     return null
   }
-  const box = selectionBBox(selectedIds, doc)
   if (!box) return null
 
   const hs = 8 / scale
@@ -248,6 +246,12 @@ export function SelectionOverlay({
     pushHistory()
     const local = svgLocalFromClient(e.clientX, e.clientY, svg)
     if (!local) return
+    const liveDoc = useDocStore.getState().doc
+    const liveSelected = useDocStore.getState().selectedIds
+    const parentIndex = buildParentIndex(liveDoc)
+    const others = Object.values(liveDoc.nodes)
+      .filter((n) => n.visible && !liveSelected.includes(n.id) && !parentIndex.has(n.id))
+      .map((n) => nodeBBox(n, liveDoc))
     drag.current = {
       kind,
       startLocalX: local.x,
@@ -256,6 +260,7 @@ export function SelectionOverlay({
       originRotation: rotation,
       startPointerAngle,
       svg,
+      others,
     }
     if (kind === 'rotate') {
       setRotating(true)

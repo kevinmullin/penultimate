@@ -7,6 +7,7 @@ import { MenuBar } from './components/MenuBar'
 import { PropertiesPanel } from './components/PropertiesPanel'
 import { SettingsModal } from './components/SettingsModal'
 import { ShapeDialog } from './components/ShapeDialog'
+import { SvgTraceDialog } from './components/SvgTraceDialog'
 import { SwatchesPanel } from './components/SwatchesPanel'
 import { ToolsRail } from './components/ToolsRail'
 import { TooltipHost } from './components/Tooltip'
@@ -43,6 +44,7 @@ export default function App() {
       <SettingsModal />
       <HelpModal />
       <ShapeDialog />
+      <SvgTraceDialog />
     </div>
   )
 }

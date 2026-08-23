@@ -1,13 +1,16 @@
 import { create } from 'zustand'
 import { snapBBox, snapPoint } from '../canvas/snap'
 import {
+  buildParentIndex,
   collectDescendants,
   nodeBBox,
   parentOf,
+  pathBBox,
   scaleNodeFromBox,
   selectionBBox,
   setNodeRotation,
   translateNode,
+  unionBoxes,
 } from '../geometry'
 import { alignNodes, distributeNodes, type AlignMode, type DistributeMode } from '../ops/align'
 import { makeClippingMask, releaseClippingMask } from '../ops/clipMask'
@@ -29,8 +32,12 @@ import {
   createEmptyDocument,
   defaultStyle,
   defaultTextStyle,
+  normalizeNode,
   syncArtboardFromActive,
   type ArtboardFrame,
+  type BBox,
+  type GroupNode,
+  type PathNode,
   type SnapGuide,
   type Tool,
   type VecNode,
@@ -84,6 +91,8 @@ type DocState = {
     x: number
     y: number
   }
+  /** Id of the ImageNode open in the "Convert to SVG" dialog, null = closed. */
+  svgTraceNodeId: string | null
   /** Canvas text edit session — blocks tool hotkeys even if focus slips. */
   editingTextId: string | null
   /** Last soft-save timestamp (ms), null until first write. */
@@ -108,6 +117,21 @@ type DocState = {
   toggleHelpOpen: () => void
   setShapeDialog: (
     dialog: DocState['shapeDialog'],
+  ) => void
+  setSvgTraceNodeId: (id: string | null) => void
+  /**
+   * Insert traced paths as a new group above `imageNodeId` and hide the
+   * original raster (kept, not deleted). One history checkpoint.
+   */
+  commitSvgTrace: (
+    imageNodeId: string,
+    paths: Array<{
+      d: string
+      fillHex: string
+      strokeHex: string
+      strokeWidth: number
+      opacity: number
+    }>,
   ) => void
   setEditingTextId: (id: string | null) => void
   setAutosaveAt: (at: number | null) => void
@@ -146,7 +170,7 @@ type DocState = {
   toggleLocked: (id: string) => void
 
   nudgeSelected: (dx: number, dy: number) => void
-  moveSelectedTo: (x: number, y: number) => void
+  moveSelectedTo: (x: number, y: number, othersOverride?: BBox[]) => void
   resizeSelectionTo: (newBox: { x: number; y: number; width: number; height: number }) => void
   rotateSelected: (rotation: number) => void
   applyStyleToSelected: (
@@ -197,36 +221,43 @@ type DocState = {
 
 let clipboard: { nodes: Record<string, VecNode>; zOrder: string[] } | null = null
 
+/**
+ * INVARIANT this relies on: node objects (and artboards/manualGuides
+ * elements) are never mutated in place anywhere in this codebase — every
+ * update replaces the whole object via spread (`{ ...n, ...patch }`).
+ * That means a shallow copy of `nodes`/`artboards`/`manualGuides` is enough
+ * for undo/redo correctness; a deep `structuredClone` per node is wasted
+ * work (real cost on large documents). If any future code ever mutates a
+ * live node's fields in place instead of replacing the node, this shallow
+ * copy would silently corrupt history snapshots — don't do that.
+ */
 function snapshotOf(doc: VectorDocument): Snapshot {
   return {
     name: doc.name,
     artboard: { ...doc.artboard },
-    artboards: doc.artboards.map((a) => ({ ...a })),
+    artboards: [...doc.artboards],
     activeArtboardId: doc.activeArtboardId,
     settings: { ...doc.settings },
-    nodes: Object.fromEntries(
-      Object.entries(doc.nodes).map(([k, v]) => [k, structuredClone(v)]),
-    ),
+    nodes: { ...doc.nodes },
     zOrder: [...doc.zOrder],
     swatches: [...doc.swatches],
-    manualGuides: doc.manualGuides.map((g) => ({ ...g })),
+    manualGuides: [...doc.manualGuides],
   }
 }
 
+/** See the invariant documented on `snapshotOf` above — applies here too. */
 function applySnapshot(s: Snapshot): VectorDocument {
   return syncArtboardFromActive({
     version: 1,
     name: s.name,
     artboard: { ...s.artboard },
-    artboards: s.artboards.map((a) => ({ ...a })),
+    artboards: [...s.artboards],
     activeArtboardId: s.activeArtboardId,
     settings: { ...s.settings },
-    nodes: Object.fromEntries(
-      Object.entries(s.nodes).map(([k, v]) => [k, structuredClone(v)]),
-    ),
+    nodes: { ...s.nodes },
     zOrder: [...s.zOrder],
     swatches: [...(s.swatches ?? [])],
-    manualGuides: (s.manualGuides ?? []).map((g) => ({ ...g })),
+    manualGuides: [...(s.manualGuides ?? [])],
   })
 }
 
@@ -271,6 +302,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   settingsOpen: false,
   helpOpen: false,
   shapeDialog: null,
+  svgTraceNodeId: null,
   editingTextId: null,
   autosaveAt: null,
 
@@ -301,6 +333,66 @@ export const useDocStore = create<DocState>((set, get) => ({
   setHelpOpen: (helpOpen) => set({ helpOpen }),
   toggleHelpOpen: () => set((s) => ({ helpOpen: !s.helpOpen })),
   setShapeDialog: (shapeDialog) => set({ shapeDialog }),
+  setSvgTraceNodeId: (svgTraceNodeId) => set({ svgTraceNodeId }),
+
+  commitSvgTrace: (imageNodeId, paths) => {
+    const { doc } = get()
+    const imageNode = doc.nodes[imageNodeId]
+    if (!imageNode || imageNode.type !== 'image' || paths.length === 0) return
+
+    get().pushHistory()
+
+    const nodes = { ...doc.nodes }
+    const pathIds: string[] = []
+    for (const p of paths) {
+      const id = nextId('path')
+      const pathNode: PathNode = normalizeNode({
+        id,
+        type: 'path',
+        name: 'Traced Path',
+        visible: true,
+        locked: false,
+        rotation: 0,
+        style: {
+          ...defaultStyle(),
+          fill: paintSolid(p.fillHex),
+          stroke: paintSolid(p.strokeHex),
+          strokeWidth: p.strokeWidth,
+          opacity: p.opacity,
+        },
+        d: p.d,
+      }) as PathNode
+      nodes[id] = pathNode
+      pathIds.push(id)
+    }
+
+    const box = unionBoxes(pathIds.map((id) => pathBBox((nodes[id] as PathNode).d)))
+    const groupId = nextId('group')
+    const group: GroupNode = {
+      id: groupId,
+      type: 'group',
+      name: 'Traced SVG',
+      visible: true,
+      locked: false,
+      rotation: 0,
+      style: defaultStyle(),
+      children: pathIds,
+      x: box.x,
+      y: box.y,
+    }
+    nodes[groupId] = group
+    nodes[imageNodeId] = { ...imageNode, visible: false }
+
+    const imgIndex = doc.zOrder.indexOf(imageNodeId)
+    const zOrder = [...doc.zOrder]
+    zOrder.splice(imgIndex + 1, 0, groupId)
+
+    set((s) => ({
+      doc: { ...s.doc, nodes, zOrder },
+      selectedIds: [groupId],
+    }))
+  },
+
   setEditingTextId: (editingTextId) => set({ editingTextId }),
   setAutosaveAt: (autosaveAt) => set({ autosaveAt }),
 
@@ -676,13 +768,18 @@ export const useDocStore = create<DocState>((set, get) => ({
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
 
-  moveSelectedTo: (x, y) => {
+  moveSelectedTo: (x, y, othersOverride) => {
     const { selectedIds, doc } = get()
     const box = selectionBBox(selectedIds, doc)
     if (!box) return
-    const others = Object.values(doc.nodes)
-      .filter((n) => n.visible && !selectedIds.includes(n.id) && !parentOf(n.id, doc))
-      .map((n) => nodeBBox(n, doc))
+    const others =
+      othersOverride ??
+      (() => {
+        const parentIndex = buildParentIndex(doc)
+        return Object.values(doc.nodes)
+          .filter((n) => n.visible && !selectedIds.includes(n.id) && !parentIndex.has(n.id))
+          .map((n) => nodeBBox(n, doc))
+      })()
     const snapped = snapBBox(
       { ...box, x, y },
       others,

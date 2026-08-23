@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import { PaintControl } from './PaintControl'
 import { FontSelect } from './FontSelect'
-import { IconButton } from './Icon'
+import { Icon, IconButton } from './Icon'
 import { PanelHeader } from './PanelHeader'
 import { hasEditableGeometry, ShapeGeometryFields } from './ShapeGeometryFields'
 import { useDocStore } from '../store/documentStore'
@@ -349,6 +349,19 @@ export function PropertiesPanel() {
               </div>
             )}
           </Section>
+
+          {primary.type === 'image' && !mixed && (
+            <Section title="Image">
+              <button
+                type="button"
+                className="ghost-btn svg-trace-trigger"
+                onClick={() => useDocStore.getState().setSvgTraceNodeId(primary.id)}
+              >
+                <Icon name="convert-outlines" />
+                Convert to SVG…
+              </button>
+            </Section>
+          )}
 
           {primary.type === 'text' && !mixed && (
             <Section title="Type">

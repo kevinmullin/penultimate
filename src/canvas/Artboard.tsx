@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactMouseEvent } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactMouseEvent } from 'react'
 import { defaultStyle, defaultTextStyle, nextId, snapPoint, useDocStore } from '../store/documentStore'
 import { paintNone } from '../style/paint'
 import {
   artboardFramesExtent,
+  buildParentIndex,
   documentExtent,
+  nodeBBox,
   parentOf,
   selectionBBox,
   idsInMarquee,
@@ -18,7 +20,54 @@ import { TextEditOverlay } from './TextEditOverlay'
 import { Rulers } from '../components/Rulers'
 import { pointsToPolylineD, simplifyPoints } from '../ops/pencil'
 import { polygonPath, starPath } from '../ops/shapes'
-import type { BBox, VecNode } from '../types'
+import type { BBox, Tool, VecNode, VectorDocument } from '../types'
+
+/**
+ * Memoized so panning/marquee-dragging (Artboard's own high-frequency local
+ * state) doesn't force a re-diff of every node on the canvas — only re-renders
+ * when the document, tool, or the two handler props actually change.
+ */
+const NodeList = memo(function NodeList({
+  doc,
+  tool,
+  handMode,
+  outlineMode,
+  onPointerDown,
+  onDoubleClick,
+  editingTextId,
+  liveEditText,
+}: {
+  doc: VectorDocument
+  tool: Tool
+  handMode: boolean
+  outlineMode: boolean
+  onPointerDown: (id: string, e: ReactPointerEvent) => void
+  onDoubleClick: (id: string, e: ReactMouseEvent) => void
+  editingTextId: string | null
+  liveEditText: string | null
+}) {
+  return (
+    <g pointerEvents={isCreateTool(tool) || handMode ? 'none' : 'auto'}>
+      {doc.zOrder.map((id) => {
+        const node = doc.nodes[id]
+        if (!node) return null
+        return (
+          <NodeView
+            key={id}
+            node={node}
+            doc={doc}
+            outlineMode={outlineMode}
+            tool={tool}
+            onPointerDown={onPointerDown}
+            onDoubleClick={onDoubleClick}
+            editingTextId={editingTextId}
+            liveEditText={liveEditText}
+          />
+        )
+      })}
+    </g>
+  )
+})
 
 export function Artboard() {
   const doc = useDocStore((s) => s.doc)
@@ -83,6 +132,8 @@ export function Artboard() {
     startLocalX: number
     startLocalY: number
     originBox: BBox
+    /** Other nodes' bboxes, cached at drag-start (see geometry.ts buildParentIndex). */
+    others: BBox[]
   } | null>(null)
   const panDrag = useRef<{
     clientX: number
@@ -116,6 +167,17 @@ export function Artboard() {
     () => artboardFramesExtent(doc),
     [doc.artboards, doc.artboard],
   )
+  const gradientExtra = useMemo(() => {
+    if (!draftNode) return undefined
+    return [
+      ...(draftNode.style.fill.type === 'linear' || draftNode.style.fill.type === 'radial'
+        ? [{ id: `fill-${draftNode.id}`, paint: draftNode.style.fill }]
+        : []),
+      ...(draftNode.style.stroke.type === 'linear' || draftNode.style.stroke.type === 'radial'
+        ? [{ id: `stroke-${draftNode.id}`, paint: draftNode.style.stroke }]
+        : []),
+    ]
+  }, [draftNode])
 
   const beginTextEdit = (id: string, opts?: { isNew?: boolean }) => {
     const n = useDocStore.getState().doc.nodes[id]
@@ -438,10 +500,15 @@ export function Artboard() {
     svgRef.current?.setPointerCapture(e.pointerId)
     pushHistory()
     const local = toLocal(e)
+    const parentIndex = buildParentIndex(doc)
+    const others = Object.values(doc.nodes)
+      .filter((n) => n.visible && !after.selectedIds.includes(n.id) && !parentIndex.has(n.id))
+      .map((n) => nodeBBox(n, doc))
     moveDrag.current = {
       startLocalX: local.x,
       startLocalY: local.y,
       originBox: { ...box },
+      others,
     }
   }
 
@@ -452,6 +519,21 @@ export function Artboard() {
       beginTextEdit(id)
     }
   }
+
+  // Referentially-stable wrappers for NodeList's memo: onNodePointerDown/
+  // onNodeDoubleClick close over lots of render-fresh state and aren't
+  // memoized themselves, so we route through a ref instead of chasing a
+  // useCallback dependency list through their whole closure chain.
+  const onNodePointerDownRef = useRef(onNodePointerDown)
+  onNodePointerDownRef.current = onNodePointerDown
+  const stableOnNodePointerDown = useCallback((id: string, e: ReactPointerEvent) => {
+    onNodePointerDownRef.current(id, e)
+  }, [])
+  const onNodeDoubleClickRef = useRef(onNodeDoubleClick)
+  onNodeDoubleClickRef.current = onNodeDoubleClick
+  const stableOnNodeDoubleClick = useCallback((id: string, e: ReactMouseEvent) => {
+    onNodeDoubleClickRef.current(id, e)
+  }, [])
 
   const onBackgroundDown = (e: ReactPointerEvent) => {
     // Kill any stray DOM text selection (SVG <text> is otherwise selectable while dragging).
@@ -567,6 +649,7 @@ export function Artboard() {
       moveSelectedTo(
         moveDrag.current.originBox.x + dx,
         moveDrag.current.originBox.y + dy,
+        moveDrag.current.others,
       )
       return
     }
@@ -905,23 +988,7 @@ export function Artboard() {
           if (tool === 'pen' && !penDrag.current) setPenCursor(null)
         }}
       >
-        <GradientDefs
-          doc={doc}
-          extra={
-            draftNode
-              ? [
-                  ...(draftNode.style.fill.type === 'linear' ||
-                  draftNode.style.fill.type === 'radial'
-                    ? [{ id: `fill-${draftNode.id}`, paint: draftNode.style.fill }]
-                    : []),
-                  ...(draftNode.style.stroke.type === 'linear' ||
-                  draftNode.style.stroke.type === 'radial'
-                    ? [{ id: `stroke-${draftNode.id}`, paint: draftNode.style.stroke }]
-                    : []),
-                ]
-              : undefined
-          }
-        />
+        <GradientDefs doc={doc} extra={gradientExtra} />
         <defs>
           <filter
             id="artboard-frame-shadow"
@@ -964,27 +1031,22 @@ export function Artboard() {
             />
           </g>
         ))}
-        <g pointerEvents={isCreateTool(tool) || handMode ? 'none' : 'auto'}>
-          {doc.zOrder.map((id) => {
-            const node = doc.nodes[id]
-            if (!node) return null
-            return (
-              <NodeView
-                key={id}
-                node={node}
-                doc={doc}
-                onPointerDown={onNodePointerDown}
-                onDoubleClick={onNodeDoubleClick}
-                editingTextId={editingTextId}
-                liveEditText={liveEditText}
-              />
-            )
-          })}
-        </g>
+        <NodeList
+          doc={doc}
+          tool={tool}
+          handMode={handMode}
+          outlineMode={outlineMode}
+          onPointerDown={stableOnNodePointerDown}
+          onDoubleClick={stableOnNodeDoubleClick}
+          editingTextId={editingTextId}
+          liveEditText={liveEditText}
+        />
         {draftNode && (
           <NodeView
             node={draftNode}
             doc={doc}
+            outlineMode={outlineMode}
+            tool={tool}
             onPointerDown={() => undefined}
           />
         )}

@@ -276,6 +276,21 @@ export function parentOf(id: string, doc: VectorDocument): string | null {
   return null
 }
 
+/**
+ * O(1)-lookup version of `parentOf` for hot paths (e.g. per-pointermove
+ * during a drag) — `parentOf` itself is O(n) per call and shouldn't be
+ * called in a loop over many nodes. Build once per gesture, not per event.
+ */
+export function buildParentIndex(doc: VectorDocument): Map<string, string> {
+  const index = new Map<string, string>()
+  for (const n of Object.values(doc.nodes)) {
+    if (n.type === 'group') {
+      for (const childId of n.children) index.set(childId, n.id)
+    }
+  }
+  return index
+}
+
 export function topLevelIds(doc: VectorDocument): string[] {
   return doc.zOrder.filter((id) => doc.nodes[id])
 }
