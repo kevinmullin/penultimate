@@ -178,7 +178,12 @@ type DocState = {
   toggleLocked: (id: string) => void
 
   nudgeSelected: (dx: number, dy: number) => void
-  moveSelectedTo: (x: number, y: number, othersOverride?: BBox[]) => void
+  moveSelectedTo: (
+    x: number,
+    y: number,
+    othersOverride?: BBox[],
+    originBoxOverride?: BBox,
+  ) => void
   resizeSelectionTo: (newBox: { x: number; y: number; width: number; height: number }) => void
   rotateSelected: (rotation: number) => void
   applyStyleToSelected: (
@@ -778,9 +783,13 @@ export const useDocStore = create<DocState>((set, get) => ({
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
 
-  moveSelectedTo: (x, y, othersOverride) => {
+  moveSelectedTo: (x, y, othersOverride, originBoxOverride) => {
     const { selectedIds, doc } = get()
-    const box = selectionBBox(selectedIds, doc)
+    // Callers that already tracked the drag from a fixed origin (Artboard,
+    // SelectionOverlay) pass it straight through — the document hasn't
+    // moved since then, so recomputing it here would just be another full
+    // bbox union (path-bounds parse for every selected node) for nothing.
+    const box = originBoxOverride ?? selectionBBox(selectedIds, doc)
     if (!box) return
     const others =
       othersOverride ??

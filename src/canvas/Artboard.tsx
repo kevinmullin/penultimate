@@ -773,7 +773,7 @@ export function Artboard() {
       // rewritten. Skip entirely for a plain click (no pointer movement) so
       // selecting a large group doesn't pay the translate cost for nothing.
       if (dx !== 0 || dy !== 0) {
-        moveSelectedTo(originBox.x + dx, originBox.y + dy, others)
+        moveSelectedTo(originBox.x + dx, originBox.y + dy, others, originBox)
       }
       if (svgRef.current?.hasPointerCapture(e.pointerId)) {
         svgRef.current.releasePointerCapture(e.pointerId)

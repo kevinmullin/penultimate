@@ -225,7 +225,12 @@ export function SelectionOverlay({
         setDragOffset(null)
         // Single commit for the whole gesture (see onMove's 'move' branch).
         if (d.moveDx !== 0 || d.moveDy !== 0) {
-          moveSelectedTo(d.originBox.x + d.moveDx, d.originBox.y + d.moveDy, d.others)
+          moveSelectedTo(
+            d.originBox.x + d.moveDx,
+            d.originBox.y + d.moveDy,
+            d.others,
+            d.originBox,
+          )
         }
       }
     }
