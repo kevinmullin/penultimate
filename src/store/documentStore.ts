@@ -72,6 +72,13 @@ type DocState = {
   guides: SnapGuide[]
   penDraft: PenDraft | null
   draftNode: VecNode | null
+  /**
+   * Live translate offset for an in-progress move drag, shown as an SVG
+   * transform instead of mutating every selected node's geometry per
+   * pointermove — keeps dragging large groups (5000+ children) smooth.
+   * Committed into the document once via `moveSelectedTo` on pointer up.
+   */
+  dragOffset: { dx: number; dy: number } | null
   past: Snapshot[]
   future: Snapshot[]
   outlineMode: boolean
@@ -102,6 +109,7 @@ type DocState = {
   setSpaceHand: (on: boolean) => void
   setGuides: (guides: SnapGuide[]) => void
   setDraftNode: (node: VecNode | null) => void
+  setDragOffset: (offset: { dx: number; dy: number } | null) => void
   select: (ids: string[], additive?: boolean) => void
   clearSelection: () => void
   setOutlineMode: (on: boolean) => void
@@ -291,6 +299,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   guides: [],
   penDraft: null,
   draftNode: null,
+  dragOffset: null,
   past: [],
   future: [],
   outlineMode: false,
@@ -310,6 +319,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   setSpaceHand: (on) => set({ spaceHand: on }),
   setGuides: (guides) => set({ guides }),
   setDraftNode: (node) => set({ draftNode: node }),
+  setDragOffset: (offset) => set({ dragOffset: offset }),
   setOutlineMode: (outlineMode) => set({ outlineMode }),
   setAspectLock: (aspectLock) => set({ aspectLock }),
   setShowRulers: (showRulers) => set({ showRulers }),

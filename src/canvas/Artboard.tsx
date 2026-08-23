@@ -16,6 +16,7 @@ import { GradientDefs } from './GradientDefs'
 import { NodeView, isCreateTool } from './NodeViews'
 import { PathAnchorOverlay } from './PathAnchorOverlay'
 import { SelectionOverlay } from './SelectionOverlay'
+import { snapBBox } from './snap'
 import { TextEditOverlay } from './TextEditOverlay'
 import { Rulers } from '../components/Rulers'
 import { pointsToPolylineD, simplifyPoints } from '../ops/pencil'
@@ -36,6 +37,8 @@ const NodeList = memo(function NodeList({
   onDoubleClick,
   editingTextId,
   liveEditText,
+  selectedIds,
+  dragOffset,
 }: {
   doc: VectorDocument
   tool: Tool
@@ -45,15 +48,16 @@ const NodeList = memo(function NodeList({
   onDoubleClick: (id: string, e: ReactMouseEvent) => void
   editingTextId: string | null
   liveEditText: string | null
+  selectedIds: string[]
+  dragOffset: { dx: number; dy: number } | null
 }) {
   return (
     <g pointerEvents={isCreateTool(tool) || handMode ? 'none' : 'auto'}>
       {doc.zOrder.map((id) => {
         const node = doc.nodes[id]
         if (!node) return null
-        return (
+        const view = (
           <NodeView
-            key={id}
             node={node}
             doc={doc}
             outlineMode={outlineMode}
@@ -64,6 +68,17 @@ const NodeList = memo(function NodeList({
             liveEditText={liveEditText}
           />
         )
+        // Live drag preview: translate the whole selected node via a single
+        // transform instead of mutating (and re-diffing) every descendant —
+        // the only way dragging a 5000+-shape group stays smooth.
+        if (dragOffset && selectedIds.includes(id)) {
+          return (
+            <g key={id} transform={`translate(${dragOffset.dx} ${dragOffset.dy})`}>
+              {view}
+            </g>
+          )
+        }
+        return <g key={id}>{view}</g>
       })}
     </g>
   )
@@ -85,6 +100,9 @@ export function Artboard() {
   const moveSelectedTo = useDocStore((s) => s.moveSelectedTo)
   const pushHistory = useDocStore((s) => s.pushHistory)
   const setGuides = useDocStore((s) => s.setGuides)
+  const selectedIds = useDocStore((s) => s.selectedIds)
+  const dragOffset = useDocStore((s) => s.dragOffset)
+  const setDragOffset = useDocStore((s) => s.setDragOffset)
   const sampleStyleFromNode = useDocStore((s) => s.sampleStyleFromNode)
   const outlineMode = useDocStore((s) => s.outlineMode)
   const setActiveArtboard = useDocStore((s) => s.setActiveArtboard)
@@ -646,11 +664,23 @@ export function Artboard() {
       const local = toLocal(e)
       const dx = local.x - moveDrag.current.startLocalX
       const dy = local.y - moveDrag.current.startLocalY
-      moveSelectedTo(
-        moveDrag.current.originBox.x + dx,
-        moveDrag.current.originBox.y + dy,
-        moveDrag.current.others,
+      const { originBox, others } = moveDrag.current
+      // Live preview only — snap and show the offset via transform, don't
+      // touch the document. Mutating every selected node's geometry (and
+      // re-diffing it) on every pointermove is what makes dragging a large
+      // group unusable; the real move is committed once on pointer up.
+      const snapped = snapBBox(
+        { ...originBox, x: originBox.x + dx, y: originBox.y + dy },
+        others,
+        doc.artboards,
+        doc.settings,
+        doc.manualGuides,
       )
+      setDragOffset({
+        dx: snapped.x - originBox.x,
+        dy: snapped.y - originBox.y,
+      })
+      setGuides(snapped.guides)
       return
     }
 
@@ -731,8 +761,20 @@ export function Artboard() {
     }
 
     if (moveDrag.current) {
+      const { originBox, others } = moveDrag.current
+      const local = toLocal(e)
+      const dx = local.x - moveDrag.current.startLocalX
+      const dy = local.y - moveDrag.current.startLocalY
       moveDrag.current = null
+      setDragOffset(null)
       setGuides([])
+      // Single commit for the whole gesture — this is the only point the
+      // document (and every selected descendant's geometry) actually gets
+      // rewritten. Skip entirely for a plain click (no pointer movement) so
+      // selecting a large group doesn't pay the translate cost for nothing.
+      if (dx !== 0 || dy !== 0) {
+        moveSelectedTo(originBox.x + dx, originBox.y + dy, others)
+      }
       if (svgRef.current?.hasPointerCapture(e.pointerId)) {
         svgRef.current.releasePointerCapture(e.pointerId)
       }
@@ -1040,6 +1082,8 @@ export function Artboard() {
           onDoubleClick={stableOnNodeDoubleClick}
           editingTextId={editingTextId}
           liveEditText={liveEditText}
+          selectedIds={selectedIds}
+          dragOffset={dragOffset}
         />
         {draftNode && (
           <NodeView
