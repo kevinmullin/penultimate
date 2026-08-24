@@ -2,7 +2,7 @@ import { memo, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactM
 import { paintAttrValue } from '../style/paint'
 import { effectiveStrokeAlign } from '../style/strokeAlign'
 import { nodeBBox } from '../geometry'
-import type { Tool, VecNode, VectorDocument } from '../types'
+import type { GroupNode, Tool, VecNode, VectorDocument } from '../types'
 import { cssCursorForTool } from './toolCursors'
 
 /** Tools that draw a new object from a drag/click on the artboard. */
@@ -46,6 +46,21 @@ function strokeExtras(node: VecNode): Partial<PaintSlice> {
 function rotationProps(node: VecNode, cx: number, cy: number) {
   if (!node.rotation) return undefined
   return `rotate(${node.rotation} ${cx} ${cy})`
+}
+
+/**
+ * Group transform: an unbaked move offset (see `GroupNode.pendingMove`) plus
+ * rotation. Transform lists apply right-to-left, so the rotate (around the
+ * group's original pivot) happens first, then the whole rotated result
+ * shifts by the pending offset — same effect as if the offset had been
+ * baked into every child first.
+ */
+function groupTransform(node: GroupNode): string | undefined {
+  const rotate = rotationProps(node, node.x, node.y)
+  const move = node.pendingMove
+  if (!move) return rotate
+  const translate = `translate(${move.dx} ${move.dy})`
+  return rotate ? `${translate} ${rotate}` : translate
 }
 
 function geometry(
@@ -492,6 +507,13 @@ function EffectGroup({
   const blend = node.style.blendMode
   const shadow = node.style.shadow
   const filterId = `drop-shadow-${node.id}`
+  // Common case (no blend mode, no shadow): the wrapper would be an inert
+  // <g> with no style/filter attributes — skip it entirely. At thousands of
+  // shapes, one fewer SVG element per shape is a real cut to what the
+  // browser has to lay out and paint.
+  if ((!blend || blend === 'normal') && !shadow?.enabled) {
+    return children
+  }
   return (
     <g
       style={
@@ -575,7 +597,7 @@ export const NodeView = memo(function NodeView({
       const clipId = `user-clip-${node.id}`
       return (
         <g
-          transform={rotationProps(node, node.x, node.y)}
+          transform={groupTransform(node)}
           onPointerDown={(e) => {
             e.stopPropagation()
             onPointerDown(node.id, e)
@@ -623,7 +645,7 @@ export const NodeView = memo(function NodeView({
 
     return (
       <g
-        transform={rotationProps(node, node.x, node.y)}
+        transform={groupTransform(node)}
         onPointerDown={(e) => {
           e.stopPropagation()
           onPointerDown(node.id, e)

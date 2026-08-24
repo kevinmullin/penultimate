@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { snapBBox, snapPoint } from '../canvas/snap'
 import {
+  bakeAllPendingMoves,
   buildParentIndex,
   collectDescendants,
   nodeBBox,
@@ -217,6 +218,8 @@ type DocState = {
   deletePathAnchor: (id: string, anchorIndex: number) => void
   addPathAnchor: (id: string, afterIndex: number, x: number, y: number) => void
   convertPathAnchor: (id: string, anchorIndex: number) => void
+  /** Bake every top-level group's deferred move (see `GroupNode.pendingMove`) into real child coordinates. */
+  flushGroupMoves: () => void
 
   addSwatch: (color: string) => void
   addSwatches: (colors: string[]) => void
@@ -808,6 +811,29 @@ export const useDocStore = create<DocState>((set, get) => ({
     )
     const dx = snapped.x - box.x
     const dy = snapped.y - box.y
+
+    // Moving a single top-level group: defer baking the offset into every
+    // child (that's what makes dragging a huge traced-SVG group slow) —
+    // accumulate it on the group itself and render it as a transform.
+    // Anything that later needs real child geometry bakes it first via
+    // `bakeGroupMove` (geometry.ts).
+    if (selectedIds.length === 1) {
+      const only = doc.nodes[selectedIds[0]]
+      // Restricted to top-level groups: keeps "only a top-level group can
+      // carry an unflushed pendingMove" a simple invariant (bakeAllPendingMoves
+      // only scans zOrder, not nested children) — a nested group can be
+      // selected directly from the Layers panel, so this can't be assumed.
+      if (only && !only.locked && only.type === 'group' && !parentOf(only.id, doc)) {
+        const prev = only.pendingMove ?? { dx: 0, dy: 0 }
+        const nodes = {
+          ...doc.nodes,
+          [only.id]: { ...only, pendingMove: { dx: prev.dx + dx, dy: prev.dy + dy } },
+        }
+        set((s) => ({ doc: { ...s.doc, nodes }, guides: snapped.guides }))
+        return
+      }
+    }
+
     const nodes = { ...doc.nodes }
     for (const id of selectedIds) {
       const n = nodes[id]
@@ -824,7 +850,10 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   resizeSelectionTo: (newBox) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    // Resize needs every child's real geometry to scale it — bake any
+    // deferred move first (see `moveSelectedTo` / `bakeAllPendingMoves`).
+    const doc = bakeAllPendingMoves(get().doc)
     const oldBox = selectionBBox(selectedIds, doc)
     if (!oldBox) return
     const nodes = { ...doc.nodes }
@@ -869,9 +898,13 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   reflectSelected: (axis) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
     if (selectedIds.length === 0) return
     get().pushHistory()
+    // reflectNodes mutates the group node and its children independently
+    // (see ops/reflect.ts) — bake any deferred move first so it doesn't
+    // double up with the reflect.
+    const doc = bakeAllPendingMoves(get().doc)
     const nodes = reflectNodes(doc, selectedIds, axis)
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
@@ -895,23 +928,28 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   align: (mode, relativeToArtboard = false) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
     if (selectedIds.length === 0) return
     get().pushHistory()
+    const doc = bakeAllPendingMoves(get().doc)
     const nodes = alignNodes(doc, selectedIds, mode, relativeToArtboard)
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
 
   distribute: (mode) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
     if (selectedIds.length < 3) return
     get().pushHistory()
+    const doc = bakeAllPendingMoves(get().doc)
     const nodes = distributeNodes(doc, selectedIds, mode)
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
 
   group: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    // Keeps "only top-level groups carry an unflushed move" simple —
+    // otherwise a group-with-pendingMove could end up nested.
+    const doc = bakeAllPendingMoves(get().doc)
     const result = groupSelected(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -922,7 +960,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   ungroup: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = ungroupSelected(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -933,7 +972,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   makeClipMask: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = makeClippingMask(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -944,7 +984,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   releaseClipMask: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = releaseClippingMask(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -1059,7 +1100,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   pathfinderSelected: (op) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = pathfinder(doc, selectedIds, op)
     if (!result) return
     get().pushHistory()
@@ -1070,7 +1112,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   joinSelectedPaths: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = joinPathsOp(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -1081,7 +1124,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   scissorsAt: (pathId, x, y) => {
-    const { doc } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = scissorsSplit(doc, pathId, x, y)
     if (!result) return
     get().pushHistory()
@@ -1092,7 +1135,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   outlineStrokeSelected: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = outlineStrokeOp(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -1103,7 +1147,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   offsetPathSelected: (distance) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = offsetSelected(doc, selectedIds, distance)
     if (!result) return
     get().pushHistory()
@@ -1114,9 +1159,13 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   shearSelected: (axis, amount) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
     if (selectedIds.length === 0) return
     get().pushHistory()
+    // shearNodes mutates the group node and its children independently
+    // (see ops/shear.ts) — bake any deferred move first so it doesn't
+    // double up with the shear.
+    const doc = bakeAllPendingMoves(get().doc)
     const nodes = shearNodes(doc, selectedIds, axis, amount)
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
@@ -1159,12 +1208,14 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   movePathAnchor: (id, anchorIndex, x, y) => {
+    get().flushGroupMoves()
     const n = get().doc.nodes[id]
     if (!n || n.type !== 'path') return
     get().updatePathD(id, moveAnchor(n.d, anchorIndex, x, y))
   },
 
   deletePathAnchor: (id, anchorIndex) => {
+    get().flushGroupMoves()
     const n = get().doc.nodes[id]
     if (!n || n.type !== 'path') return
     get().pushHistory()
@@ -1172,6 +1223,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   addPathAnchor: (id, afterIndex, x, y) => {
+    get().flushGroupMoves()
     const n = get().doc.nodes[id]
     if (!n || n.type !== 'path') return
     get().pushHistory()
@@ -1179,10 +1231,15 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   convertPathAnchor: (id, anchorIndex) => {
+    get().flushGroupMoves()
     const n = get().doc.nodes[id]
     if (!n || n.type !== 'path') return
     get().pushHistory()
     get().updatePathD(id, convertAnchor(n.d, anchorIndex))
+  },
+
+  flushGroupMoves: () => {
+    set((s) => ({ doc: bakeAllPendingMoves(s.doc) }))
   },
 
   beginPen: () => set({ penDraft: { points: [] }, tool: 'pen' }),

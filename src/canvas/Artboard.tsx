@@ -198,6 +198,11 @@ export function Artboard() {
   }, [draftNode])
 
   const beginTextEdit = (id: string, opts?: { isNew?: boolean }) => {
+    // The edit overlay positions itself from the node's raw x/y via the
+    // root SVG's CTM, which doesn't know about an ancestor group's unbaked
+    // move — bake first so a text node inside a just-moved group edits in
+    // the right spot.
+    useDocStore.getState().flushGroupMoves()
     const n = useDocStore.getState().doc.nodes[id]
     if (!n || n.type !== 'text' || n.locked) return
     moveDrag.current = null
@@ -478,6 +483,10 @@ export function Artboard() {
     if (!node) return
 
     if (tool === 'direct') {
+      // Direct select targets a specific leaf's own geometry (anchor
+      // editing reads/writes it directly), which stays stale under an
+      // ancestor's unbaked move — bake before it becomes the target.
+      useDocStore.getState().flushGroupMoves()
       // Direct select prefers the leaf path/shape, not the parent group
       if (e.shiftKey) {
         select([id], true)
@@ -806,7 +815,10 @@ export function Artboard() {
       if (!dragged) {
         if (!m.additive) clearSelection()
       } else {
-        const ids = idsInMarquee(doc, box, {
+        // Direct-mode marquee compares individual children's own absolute
+        // bboxes, which stay stale under an ancestor's unbaked move.
+        if (m.mode === 'direct') useDocStore.getState().flushGroupMoves()
+        const ids = idsInMarquee(useDocStore.getState().doc, box, {
           mode: m.mode,
         })
         if (m.additive) {
