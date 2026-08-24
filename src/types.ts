@@ -175,6 +175,15 @@ export type GroupNode = NodeBase & {
    * Illustrator-style clipping mask.
    */
   clipped?: boolean
+  /**
+   * Unbaked translate from a move, rendered as an SVG transform instead of
+   * being written into every child's coordinates. Lets moving a huge group
+   * (thousands of children) stay O(1) — the move only touches this node.
+   * Anything that needs real child geometry (resize, pathfinder, direct
+   * path edit, export, ...) must bake it first via `bakeGroupMove` in
+   * geometry.ts, which clears this field back to absent.
+   */
+  pendingMove?: { dx: number; dy: number }
 }
 
 export type VecNode =

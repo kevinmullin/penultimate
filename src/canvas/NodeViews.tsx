@@ -1,9 +1,8 @@
-import type { PointerEvent as ReactPointerEvent, MouseEvent as ReactMouseEvent, ReactNode, CSSProperties } from 'react'
+import { memo, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type CSSProperties } from 'react'
 import { paintAttrValue } from '../style/paint'
 import { effectiveStrokeAlign } from '../style/strokeAlign'
 import { nodeBBox } from '../geometry'
-import type { Tool, VecNode, VectorDocument } from '../types'
-import { useDocStore } from '../store/documentStore'
+import type { GroupNode, Tool, VecNode, VectorDocument } from '../types'
 import { cssCursorForTool } from './toolCursors'
 
 /** Tools that draw a new object from a drag/click on the artboard. */
@@ -47,6 +46,21 @@ function strokeExtras(node: VecNode): Partial<PaintSlice> {
 function rotationProps(node: VecNode, cx: number, cy: number) {
   if (!node.rotation) return undefined
   return `rotate(${node.rotation} ${cx} ${cy})`
+}
+
+/**
+ * Group transform: an unbaked move offset (see `GroupNode.pendingMove`) plus
+ * rotation. Transform lists apply right-to-left, so the rotate (around the
+ * group's original pivot) happens first, then the whole rotated result
+ * shifts by the pending offset — same effect as if the offset had been
+ * baked into every child first.
+ */
+function groupTransform(node: GroupNode): string | undefined {
+  const rotate = rotationProps(node, node.x, node.y)
+  const move = node.pendingMove
+  if (!move) return rotate
+  const translate = `translate(${move.dx} ${move.dy})`
+  return rotate ? `${translate} ${rotate}` : translate
 }
 
 function geometry(
@@ -211,22 +225,40 @@ function geometry(
   }
 }
 
-function PaintedShape({
-  node,
-  onPointerDown,
-  onDoubleClick,
-  editingTextId,
-  liveEditText,
-}: {
+type PaintedShapeProps = {
   node: Exclude<VecNode, { type: 'group' }>
+  doc: VectorDocument
+  outlineMode: boolean
+  tool: Tool
   onPointerDown: (id: string, e: ReactPointerEvent) => void
   onDoubleClick?: (id: string, e: ReactMouseEvent) => void
   editingTextId?: string | null
   liveEditText?: string | null
-}) {
-  const outlineMode = useDocStore((s) => s.outlineMode)
-  const tool = useDocStore((s) => s.tool)
-  const doc = useDocStore((s) => s.doc)
+}
+
+function paintedShapePropsEqual(prev: PaintedShapeProps, next: PaintedShapeProps): boolean {
+  return (
+    prev.node === next.node &&
+    prev.doc === next.doc &&
+    prev.outlineMode === next.outlineMode &&
+    prev.tool === next.tool &&
+    prev.onPointerDown === next.onPointerDown &&
+    prev.onDoubleClick === next.onDoubleClick &&
+    prev.editingTextId === next.editingTextId &&
+    prev.liveEditText === next.liveEditText
+  )
+}
+
+const PaintedShape = memo(function PaintedShape({
+  node,
+  doc,
+  outlineMode,
+  tool,
+  onPointerDown,
+  onDoubleClick,
+  editingTextId,
+  liveEditText,
+}: PaintedShapeProps) {
   const toolCursor = cssCursorForTool(tool)
   const fill = paintAttrValue(node.style.fill, `fill-${node.id}`)
   const stroke = paintAttrValue(node.style.stroke, `stroke-${node.id}`)
@@ -463,7 +495,7 @@ function PaintedShape({
       </g>
     </EffectGroup>
   )
-}
+}, paintedShapePropsEqual)
 
 function EffectGroup({
   node,
@@ -475,6 +507,13 @@ function EffectGroup({
   const blend = node.style.blendMode
   const shadow = node.style.shadow
   const filterId = `drop-shadow-${node.id}`
+  // Common case (no blend mode, no shadow): the wrapper would be an inert
+  // <g> with no style/filter attributes — skip it entirely. At thousands of
+  // shapes, one fewer SVG element per shape is a real cut to what the
+  // browser has to lay out and paint.
+  if ((!blend || blend === 'normal') && !shadow?.enabled) {
+    return children
+  }
   return (
     <g
       style={
@@ -509,23 +548,41 @@ function EffectGroup({
   )
 }
 
-export function NodeView({
-  node,
-  doc,
-  onPointerDown,
-  onDoubleClick,
-  editingTextId,
-  liveEditText,
-}: {
+type NodeViewProps = {
   node: VecNode
   doc: VectorDocument
+  outlineMode: boolean
+  tool: Tool
   onPointerDown: (id: string, e: ReactPointerEvent) => void
   onDoubleClick?: (id: string, e: ReactMouseEvent) => void
   editingTextId?: string | null
   /** Live draft string while this text node is being edited in the overlay. */
   liveEditText?: string | null
-}) {
-  const tool = useDocStore((s) => s.tool)
+}
+
+function nodeViewPropsEqual(prev: NodeViewProps, next: NodeViewProps): boolean {
+  return (
+    prev.node === next.node &&
+    prev.doc === next.doc &&
+    prev.outlineMode === next.outlineMode &&
+    prev.tool === next.tool &&
+    prev.onPointerDown === next.onPointerDown &&
+    prev.onDoubleClick === next.onDoubleClick &&
+    prev.editingTextId === next.editingTextId &&
+    prev.liveEditText === next.liveEditText
+  )
+}
+
+export const NodeView = memo(function NodeView({
+  node,
+  doc,
+  outlineMode,
+  tool,
+  onPointerDown,
+  onDoubleClick,
+  editingTextId,
+  liveEditText,
+}: NodeViewProps) {
   const toolCursor = cssCursorForTool(tool)
   if (!node.visible) return null
 
@@ -540,7 +597,7 @@ export function NodeView({
       const clipId = `user-clip-${node.id}`
       return (
         <g
-          transform={rotationProps(node, node.x, node.y)}
+          transform={groupTransform(node)}
           onPointerDown={(e) => {
             e.stopPropagation()
             onPointerDown(node.id, e)
@@ -560,6 +617,8 @@ export function NodeView({
           <NodeView
             node={mask}
             doc={doc}
+            outlineMode={outlineMode}
+            tool={tool}
             onPointerDown={onPointerDown}
             onDoubleClick={onDoubleClick}
             editingTextId={editingTextId}
@@ -571,6 +630,8 @@ export function NodeView({
                 key={child.id}
                 node={child}
                 doc={doc}
+                outlineMode={outlineMode}
+                tool={tool}
                 onPointerDown={onPointerDown}
                 onDoubleClick={onDoubleClick}
                 editingTextId={editingTextId}
@@ -584,7 +645,7 @@ export function NodeView({
 
     return (
       <g
-        transform={rotationProps(node, node.x, node.y)}
+        transform={groupTransform(node)}
         onPointerDown={(e) => {
           e.stopPropagation()
           onPointerDown(node.id, e)
@@ -603,6 +664,8 @@ export function NodeView({
               key={id}
               node={child}
               doc={doc}
+              outlineMode={outlineMode}
+              tool={tool}
               onPointerDown={onPointerDown}
               onDoubleClick={onDoubleClick}
               editingTextId={editingTextId}
@@ -617,10 +680,13 @@ export function NodeView({
   return (
     <PaintedShape
       node={node}
+      doc={doc}
+      outlineMode={outlineMode}
+      tool={tool}
       onPointerDown={onPointerDown}
       onDoubleClick={onDoubleClick}
       editingTextId={editingTextId}
       liveEditText={liveEditText}
     />
   )
-}
+}, nodeViewPropsEqual)

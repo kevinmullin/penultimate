@@ -1,13 +1,17 @@
 import { create } from 'zustand'
 import { snapBBox, snapPoint } from '../canvas/snap'
 import {
+  bakeAllPendingMoves,
+  buildParentIndex,
   collectDescendants,
   nodeBBox,
   parentOf,
+  pathBBox,
   scaleNodeFromBox,
   selectionBBox,
   setNodeRotation,
   translateNode,
+  unionBoxes,
 } from '../geometry'
 import { alignNodes, distributeNodes, type AlignMode, type DistributeMode } from '../ops/align'
 import { makeClippingMask, releaseClippingMask } from '../ops/clipMask'
@@ -29,8 +33,12 @@ import {
   createEmptyDocument,
   defaultStyle,
   defaultTextStyle,
+  normalizeNode,
   syncArtboardFromActive,
   type ArtboardFrame,
+  type BBox,
+  type GroupNode,
+  type PathNode,
   type SnapGuide,
   type Tool,
   type VecNode,
@@ -65,6 +73,13 @@ type DocState = {
   guides: SnapGuide[]
   penDraft: PenDraft | null
   draftNode: VecNode | null
+  /**
+   * Live translate offset for an in-progress move drag, shown as an SVG
+   * transform instead of mutating every selected node's geometry per
+   * pointermove — keeps dragging large groups (5000+ children) smooth.
+   * Committed into the document once via `moveSelectedTo` on pointer up.
+   */
+  dragOffset: { dx: number; dy: number } | null
   past: Snapshot[]
   future: Snapshot[]
   outlineMode: boolean
@@ -84,6 +99,8 @@ type DocState = {
     x: number
     y: number
   }
+  /** Id of the ImageNode open in the "Convert to SVG" dialog, null = closed. */
+  svgTraceNodeId: string | null
   /** Canvas text edit session — blocks tool hotkeys even if focus slips. */
   editingTextId: string | null
   /** Last soft-save timestamp (ms), null until first write. */
@@ -93,6 +110,7 @@ type DocState = {
   setSpaceHand: (on: boolean) => void
   setGuides: (guides: SnapGuide[]) => void
   setDraftNode: (node: VecNode | null) => void
+  setDragOffset: (offset: { dx: number; dy: number } | null) => void
   select: (ids: string[], additive?: boolean) => void
   clearSelection: () => void
   setOutlineMode: (on: boolean) => void
@@ -108,6 +126,21 @@ type DocState = {
   toggleHelpOpen: () => void
   setShapeDialog: (
     dialog: DocState['shapeDialog'],
+  ) => void
+  setSvgTraceNodeId: (id: string | null) => void
+  /**
+   * Insert traced paths as a new group above `imageNodeId` and hide the
+   * original raster (kept, not deleted). One history checkpoint.
+   */
+  commitSvgTrace: (
+    imageNodeId: string,
+    paths: Array<{
+      d: string
+      fillHex: string
+      strokeHex: string
+      strokeWidth: number
+      opacity: number
+    }>,
   ) => void
   setEditingTextId: (id: string | null) => void
   setAutosaveAt: (at: number | null) => void
@@ -146,7 +179,12 @@ type DocState = {
   toggleLocked: (id: string) => void
 
   nudgeSelected: (dx: number, dy: number) => void
-  moveSelectedTo: (x: number, y: number) => void
+  moveSelectedTo: (
+    x: number,
+    y: number,
+    othersOverride?: BBox[],
+    originBoxOverride?: BBox,
+  ) => void
   resizeSelectionTo: (newBox: { x: number; y: number; width: number; height: number }) => void
   rotateSelected: (rotation: number) => void
   applyStyleToSelected: (
@@ -180,6 +218,8 @@ type DocState = {
   deletePathAnchor: (id: string, anchorIndex: number) => void
   addPathAnchor: (id: string, afterIndex: number, x: number, y: number) => void
   convertPathAnchor: (id: string, anchorIndex: number) => void
+  /** Bake every top-level group's deferred move (see `GroupNode.pendingMove`) into real child coordinates. */
+  flushGroupMoves: () => void
 
   addSwatch: (color: string) => void
   addSwatches: (colors: string[]) => void
@@ -197,36 +237,43 @@ type DocState = {
 
 let clipboard: { nodes: Record<string, VecNode>; zOrder: string[] } | null = null
 
+/**
+ * INVARIANT this relies on: node objects (and artboards/manualGuides
+ * elements) are never mutated in place anywhere in this codebase — every
+ * update replaces the whole object via spread (`{ ...n, ...patch }`).
+ * That means a shallow copy of `nodes`/`artboards`/`manualGuides` is enough
+ * for undo/redo correctness; a deep `structuredClone` per node is wasted
+ * work (real cost on large documents). If any future code ever mutates a
+ * live node's fields in place instead of replacing the node, this shallow
+ * copy would silently corrupt history snapshots — don't do that.
+ */
 function snapshotOf(doc: VectorDocument): Snapshot {
   return {
     name: doc.name,
     artboard: { ...doc.artboard },
-    artboards: doc.artboards.map((a) => ({ ...a })),
+    artboards: [...doc.artboards],
     activeArtboardId: doc.activeArtboardId,
     settings: { ...doc.settings },
-    nodes: Object.fromEntries(
-      Object.entries(doc.nodes).map(([k, v]) => [k, structuredClone(v)]),
-    ),
+    nodes: { ...doc.nodes },
     zOrder: [...doc.zOrder],
     swatches: [...doc.swatches],
-    manualGuides: doc.manualGuides.map((g) => ({ ...g })),
+    manualGuides: [...doc.manualGuides],
   }
 }
 
+/** See the invariant documented on `snapshotOf` above — applies here too. */
 function applySnapshot(s: Snapshot): VectorDocument {
   return syncArtboardFromActive({
     version: 1,
     name: s.name,
     artboard: { ...s.artboard },
-    artboards: s.artboards.map((a) => ({ ...a })),
+    artboards: [...s.artboards],
     activeArtboardId: s.activeArtboardId,
     settings: { ...s.settings },
-    nodes: Object.fromEntries(
-      Object.entries(s.nodes).map(([k, v]) => [k, structuredClone(v)]),
-    ),
+    nodes: { ...s.nodes },
     zOrder: [...s.zOrder],
     swatches: [...(s.swatches ?? [])],
-    manualGuides: (s.manualGuides ?? []).map((g) => ({ ...g })),
+    manualGuides: [...(s.manualGuides ?? [])],
   })
 }
 
@@ -260,6 +307,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   guides: [],
   penDraft: null,
   draftNode: null,
+  dragOffset: null,
   past: [],
   future: [],
   outlineMode: false,
@@ -271,6 +319,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   settingsOpen: false,
   helpOpen: false,
   shapeDialog: null,
+  svgTraceNodeId: null,
   editingTextId: null,
   autosaveAt: null,
 
@@ -278,6 +327,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   setSpaceHand: (on) => set({ spaceHand: on }),
   setGuides: (guides) => set({ guides }),
   setDraftNode: (node) => set({ draftNode: node }),
+  setDragOffset: (offset) => set({ dragOffset: offset }),
   setOutlineMode: (outlineMode) => set({ outlineMode }),
   setAspectLock: (aspectLock) => set({ aspectLock }),
   setShowRulers: (showRulers) => set({ showRulers }),
@@ -301,6 +351,66 @@ export const useDocStore = create<DocState>((set, get) => ({
   setHelpOpen: (helpOpen) => set({ helpOpen }),
   toggleHelpOpen: () => set((s) => ({ helpOpen: !s.helpOpen })),
   setShapeDialog: (shapeDialog) => set({ shapeDialog }),
+  setSvgTraceNodeId: (svgTraceNodeId) => set({ svgTraceNodeId }),
+
+  commitSvgTrace: (imageNodeId, paths) => {
+    const { doc } = get()
+    const imageNode = doc.nodes[imageNodeId]
+    if (!imageNode || imageNode.type !== 'image' || paths.length === 0) return
+
+    get().pushHistory()
+
+    const nodes = { ...doc.nodes }
+    const pathIds: string[] = []
+    for (const p of paths) {
+      const id = nextId('path')
+      const pathNode: PathNode = normalizeNode({
+        id,
+        type: 'path',
+        name: 'Traced Path',
+        visible: true,
+        locked: false,
+        rotation: 0,
+        style: {
+          ...defaultStyle(),
+          fill: paintSolid(p.fillHex),
+          stroke: paintSolid(p.strokeHex),
+          strokeWidth: p.strokeWidth,
+          opacity: p.opacity,
+        },
+        d: p.d,
+      }) as PathNode
+      nodes[id] = pathNode
+      pathIds.push(id)
+    }
+
+    const box = unionBoxes(pathIds.map((id) => pathBBox((nodes[id] as PathNode).d)))
+    const groupId = nextId('group')
+    const group: GroupNode = {
+      id: groupId,
+      type: 'group',
+      name: 'Traced SVG',
+      visible: true,
+      locked: false,
+      rotation: 0,
+      style: defaultStyle(),
+      children: pathIds,
+      x: box.x,
+      y: box.y,
+    }
+    nodes[groupId] = group
+    nodes[imageNodeId] = { ...imageNode, visible: false }
+
+    const imgIndex = doc.zOrder.indexOf(imageNodeId)
+    const zOrder = [...doc.zOrder]
+    zOrder.splice(imgIndex + 1, 0, groupId)
+
+    set((s) => ({
+      doc: { ...s.doc, nodes, zOrder },
+      selectedIds: [groupId],
+    }))
+  },
+
   setEditingTextId: (editingTextId) => set({ editingTextId }),
   setAutosaveAt: (autosaveAt) => set({ autosaveAt }),
 
@@ -676,13 +786,22 @@ export const useDocStore = create<DocState>((set, get) => ({
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
 
-  moveSelectedTo: (x, y) => {
+  moveSelectedTo: (x, y, othersOverride, originBoxOverride) => {
     const { selectedIds, doc } = get()
-    const box = selectionBBox(selectedIds, doc)
+    // Callers that already tracked the drag from a fixed origin (Artboard,
+    // SelectionOverlay) pass it straight through — the document hasn't
+    // moved since then, so recomputing it here would just be another full
+    // bbox union (path-bounds parse for every selected node) for nothing.
+    const box = originBoxOverride ?? selectionBBox(selectedIds, doc)
     if (!box) return
-    const others = Object.values(doc.nodes)
-      .filter((n) => n.visible && !selectedIds.includes(n.id) && !parentOf(n.id, doc))
-      .map((n) => nodeBBox(n, doc))
+    const others =
+      othersOverride ??
+      (() => {
+        const parentIndex = buildParentIndex(doc)
+        return Object.values(doc.nodes)
+          .filter((n) => n.visible && !selectedIds.includes(n.id) && !parentIndex.has(n.id))
+          .map((n) => nodeBBox(n, doc))
+      })()
     const snapped = snapBBox(
       { ...box, x, y },
       others,
@@ -692,6 +811,29 @@ export const useDocStore = create<DocState>((set, get) => ({
     )
     const dx = snapped.x - box.x
     const dy = snapped.y - box.y
+
+    // Moving a single top-level group: defer baking the offset into every
+    // child (that's what makes dragging a huge traced-SVG group slow) —
+    // accumulate it on the group itself and render it as a transform.
+    // Anything that later needs real child geometry bakes it first via
+    // `bakeGroupMove` (geometry.ts).
+    if (selectedIds.length === 1) {
+      const only = doc.nodes[selectedIds[0]]
+      // Restricted to top-level groups: keeps "only a top-level group can
+      // carry an unflushed pendingMove" a simple invariant (bakeAllPendingMoves
+      // only scans zOrder, not nested children) — a nested group can be
+      // selected directly from the Layers panel, so this can't be assumed.
+      if (only && !only.locked && only.type === 'group' && !parentOf(only.id, doc)) {
+        const prev = only.pendingMove ?? { dx: 0, dy: 0 }
+        const nodes = {
+          ...doc.nodes,
+          [only.id]: { ...only, pendingMove: { dx: prev.dx + dx, dy: prev.dy + dy } },
+        }
+        set((s) => ({ doc: { ...s.doc, nodes }, guides: snapped.guides }))
+        return
+      }
+    }
+
     const nodes = { ...doc.nodes }
     for (const id of selectedIds) {
       const n = nodes[id]
@@ -708,7 +850,10 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   resizeSelectionTo: (newBox) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    // Resize needs every child's real geometry to scale it — bake any
+    // deferred move first (see `moveSelectedTo` / `bakeAllPendingMoves`).
+    const doc = bakeAllPendingMoves(get().doc)
     const oldBox = selectionBBox(selectedIds, doc)
     if (!oldBox) return
     const nodes = { ...doc.nodes }
@@ -753,9 +898,13 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   reflectSelected: (axis) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
     if (selectedIds.length === 0) return
     get().pushHistory()
+    // reflectNodes mutates the group node and its children independently
+    // (see ops/reflect.ts) — bake any deferred move first so it doesn't
+    // double up with the reflect.
+    const doc = bakeAllPendingMoves(get().doc)
     const nodes = reflectNodes(doc, selectedIds, axis)
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
@@ -779,23 +928,28 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   align: (mode, relativeToArtboard = false) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
     if (selectedIds.length === 0) return
     get().pushHistory()
+    const doc = bakeAllPendingMoves(get().doc)
     const nodes = alignNodes(doc, selectedIds, mode, relativeToArtboard)
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
 
   distribute: (mode) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
     if (selectedIds.length < 3) return
     get().pushHistory()
+    const doc = bakeAllPendingMoves(get().doc)
     const nodes = distributeNodes(doc, selectedIds, mode)
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
 
   group: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    // Keeps "only top-level groups carry an unflushed move" simple —
+    // otherwise a group-with-pendingMove could end up nested.
+    const doc = bakeAllPendingMoves(get().doc)
     const result = groupSelected(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -806,7 +960,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   ungroup: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = ungroupSelected(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -817,7 +972,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   makeClipMask: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = makeClippingMask(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -828,7 +984,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   releaseClipMask: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = releaseClippingMask(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -943,7 +1100,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   pathfinderSelected: (op) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = pathfinder(doc, selectedIds, op)
     if (!result) return
     get().pushHistory()
@@ -954,7 +1112,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   joinSelectedPaths: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = joinPathsOp(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -965,7 +1124,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   scissorsAt: (pathId, x, y) => {
-    const { doc } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = scissorsSplit(doc, pathId, x, y)
     if (!result) return
     get().pushHistory()
@@ -976,7 +1135,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   outlineStrokeSelected: () => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = outlineStrokeOp(doc, selectedIds)
     if (!result) return
     get().pushHistory()
@@ -987,7 +1147,8 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   offsetPathSelected: (distance) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
+    const doc = bakeAllPendingMoves(get().doc)
     const result = offsetSelected(doc, selectedIds, distance)
     if (!result) return
     get().pushHistory()
@@ -998,9 +1159,13 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   shearSelected: (axis, amount) => {
-    const { selectedIds, doc } = get()
+    const { selectedIds } = get()
     if (selectedIds.length === 0) return
     get().pushHistory()
+    // shearNodes mutates the group node and its children independently
+    // (see ops/shear.ts) — bake any deferred move first so it doesn't
+    // double up with the shear.
+    const doc = bakeAllPendingMoves(get().doc)
     const nodes = shearNodes(doc, selectedIds, axis, amount)
     set((s) => ({ doc: { ...s.doc, nodes } }))
   },
@@ -1043,12 +1208,14 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   movePathAnchor: (id, anchorIndex, x, y) => {
+    get().flushGroupMoves()
     const n = get().doc.nodes[id]
     if (!n || n.type !== 'path') return
     get().updatePathD(id, moveAnchor(n.d, anchorIndex, x, y))
   },
 
   deletePathAnchor: (id, anchorIndex) => {
+    get().flushGroupMoves()
     const n = get().doc.nodes[id]
     if (!n || n.type !== 'path') return
     get().pushHistory()
@@ -1056,6 +1223,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   addPathAnchor: (id, afterIndex, x, y) => {
+    get().flushGroupMoves()
     const n = get().doc.nodes[id]
     if (!n || n.type !== 'path') return
     get().pushHistory()
@@ -1063,10 +1231,15 @@ export const useDocStore = create<DocState>((set, get) => ({
   },
 
   convertPathAnchor: (id, anchorIndex) => {
+    get().flushGroupMoves()
     const n = get().doc.nodes[id]
     if (!n || n.type !== 'path') return
     get().pushHistory()
     get().updatePathD(id, convertAnchor(n.d, anchorIndex))
+  },
+
+  flushGroupMoves: () => {
+    set((s) => ({ doc: bakeAllPendingMoves(s.doc) }))
   },
 
   beginPen: () => set({ penDraft: { points: [] }, tool: 'pen' }),

@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useDocStore } from '../store/documentStore'
 import { anchorsToPath, parseAnchors } from '../ops/pathEdit'
 
@@ -13,8 +14,20 @@ export function PathAnchorOverlay({ scale }: { scale: number }) {
   const deletePathAnchor = useDocStore((s) => s.deletePathAnchor)
   const convertPathAnchor = useDocStore((s) => s.convertPathAnchor)
   const addPathAnchor = useDocStore((s) => s.addPathAnchor)
+  const flushGroupMoves = useDocStore((s) => s.flushGroupMoves)
 
-  if (tool !== 'direct' || spaceHand || selectedIds.length !== 1) return null
+  const active = tool === 'direct' && !spaceHand && selectedIds.length === 1
+  const activeId = active ? selectedIds[0] : null
+  // The handles below position themselves from the path's raw `d` via the
+  // root SVG's CTM (no ancestor-transform awareness) — bake any deferred
+  // ancestor move whenever this overlay becomes active for a path, not
+  // just when it was first direct-selected (the parent could have moved
+  // again since, e.g. select tool → move parent → back to direct tool).
+  useEffect(() => {
+    if (activeId) flushGroupMoves()
+  }, [activeId, flushGroupMoves])
+
+  if (!active) return null
   const node = doc.nodes[selectedIds[0]]
   if (!node || node.type !== 'path' || node.locked) return null
 

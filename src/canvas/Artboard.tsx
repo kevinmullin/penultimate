@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactMouseEvent } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type MouseEvent as ReactMouseEvent } from 'react'
 import { defaultStyle, defaultTextStyle, nextId, snapPoint, useDocStore } from '../store/documentStore'
 import { paintNone } from '../style/paint'
 import {
   artboardFramesExtent,
+  buildParentIndex,
   documentExtent,
+  nodeBBox,
   parentOf,
   selectionBBox,
   idsInMarquee,
@@ -14,11 +16,73 @@ import { GradientDefs } from './GradientDefs'
 import { NodeView, isCreateTool } from './NodeViews'
 import { PathAnchorOverlay } from './PathAnchorOverlay'
 import { SelectionOverlay } from './SelectionOverlay'
+import { snapBBox } from './snap'
 import { TextEditOverlay } from './TextEditOverlay'
 import { Rulers } from '../components/Rulers'
 import { pointsToPolylineD, simplifyPoints } from '../ops/pencil'
 import { polygonPath, starPath } from '../ops/shapes'
-import type { BBox, VecNode } from '../types'
+import type { BBox, Tool, VecNode, VectorDocument } from '../types'
+
+/**
+ * Memoized so panning/marquee-dragging (Artboard's own high-frequency local
+ * state) doesn't force a re-diff of every node on the canvas — only re-renders
+ * when the document, tool, or the two handler props actually change.
+ */
+const NodeList = memo(function NodeList({
+  doc,
+  tool,
+  handMode,
+  outlineMode,
+  onPointerDown,
+  onDoubleClick,
+  editingTextId,
+  liveEditText,
+  selectedIds,
+  dragOffset,
+}: {
+  doc: VectorDocument
+  tool: Tool
+  handMode: boolean
+  outlineMode: boolean
+  onPointerDown: (id: string, e: ReactPointerEvent) => void
+  onDoubleClick: (id: string, e: ReactMouseEvent) => void
+  editingTextId: string | null
+  liveEditText: string | null
+  selectedIds: string[]
+  dragOffset: { dx: number; dy: number } | null
+}) {
+  return (
+    <g pointerEvents={isCreateTool(tool) || handMode ? 'none' : 'auto'}>
+      {doc.zOrder.map((id) => {
+        const node = doc.nodes[id]
+        if (!node) return null
+        const view = (
+          <NodeView
+            node={node}
+            doc={doc}
+            outlineMode={outlineMode}
+            tool={tool}
+            onPointerDown={onPointerDown}
+            onDoubleClick={onDoubleClick}
+            editingTextId={editingTextId}
+            liveEditText={liveEditText}
+          />
+        )
+        // Live drag preview: translate the whole selected node via a single
+        // transform instead of mutating (and re-diffing) every descendant —
+        // the only way dragging a 5000+-shape group stays smooth.
+        if (dragOffset && selectedIds.includes(id)) {
+          return (
+            <g key={id} transform={`translate(${dragOffset.dx} ${dragOffset.dy})`}>
+              {view}
+            </g>
+          )
+        }
+        return <g key={id}>{view}</g>
+      })}
+    </g>
+  )
+})
 
 export function Artboard() {
   const doc = useDocStore((s) => s.doc)
@@ -36,6 +100,9 @@ export function Artboard() {
   const moveSelectedTo = useDocStore((s) => s.moveSelectedTo)
   const pushHistory = useDocStore((s) => s.pushHistory)
   const setGuides = useDocStore((s) => s.setGuides)
+  const selectedIds = useDocStore((s) => s.selectedIds)
+  const dragOffset = useDocStore((s) => s.dragOffset)
+  const setDragOffset = useDocStore((s) => s.setDragOffset)
   const sampleStyleFromNode = useDocStore((s) => s.sampleStyleFromNode)
   const outlineMode = useDocStore((s) => s.outlineMode)
   const setActiveArtboard = useDocStore((s) => s.setActiveArtboard)
@@ -83,6 +150,8 @@ export function Artboard() {
     startLocalX: number
     startLocalY: number
     originBox: BBox
+    /** Other nodes' bboxes, cached at drag-start (see geometry.ts buildParentIndex). */
+    others: BBox[]
   } | null>(null)
   const panDrag = useRef<{
     clientX: number
@@ -116,8 +185,24 @@ export function Artboard() {
     () => artboardFramesExtent(doc),
     [doc.artboards, doc.artboard],
   )
+  const gradientExtra = useMemo(() => {
+    if (!draftNode) return undefined
+    return [
+      ...(draftNode.style.fill.type === 'linear' || draftNode.style.fill.type === 'radial'
+        ? [{ id: `fill-${draftNode.id}`, paint: draftNode.style.fill }]
+        : []),
+      ...(draftNode.style.stroke.type === 'linear' || draftNode.style.stroke.type === 'radial'
+        ? [{ id: `stroke-${draftNode.id}`, paint: draftNode.style.stroke }]
+        : []),
+    ]
+  }, [draftNode])
 
   const beginTextEdit = (id: string, opts?: { isNew?: boolean }) => {
+    // The edit overlay positions itself from the node's raw x/y via the
+    // root SVG's CTM, which doesn't know about an ancestor group's unbaked
+    // move — bake first so a text node inside a just-moved group edits in
+    // the right spot.
+    useDocStore.getState().flushGroupMoves()
     const n = useDocStore.getState().doc.nodes[id]
     if (!n || n.type !== 'text' || n.locked) return
     moveDrag.current = null
@@ -398,6 +483,10 @@ export function Artboard() {
     if (!node) return
 
     if (tool === 'direct') {
+      // Direct select targets a specific leaf's own geometry (anchor
+      // editing reads/writes it directly), which stays stale under an
+      // ancestor's unbaked move — bake before it becomes the target.
+      useDocStore.getState().flushGroupMoves()
       // Direct select prefers the leaf path/shape, not the parent group
       if (e.shiftKey) {
         select([id], true)
@@ -438,10 +527,15 @@ export function Artboard() {
     svgRef.current?.setPointerCapture(e.pointerId)
     pushHistory()
     const local = toLocal(e)
+    const parentIndex = buildParentIndex(doc)
+    const others = Object.values(doc.nodes)
+      .filter((n) => n.visible && !after.selectedIds.includes(n.id) && !parentIndex.has(n.id))
+      .map((n) => nodeBBox(n, doc))
     moveDrag.current = {
       startLocalX: local.x,
       startLocalY: local.y,
       originBox: { ...box },
+      others,
     }
   }
 
@@ -452,6 +546,21 @@ export function Artboard() {
       beginTextEdit(id)
     }
   }
+
+  // Referentially-stable wrappers for NodeList's memo: onNodePointerDown/
+  // onNodeDoubleClick close over lots of render-fresh state and aren't
+  // memoized themselves, so we route through a ref instead of chasing a
+  // useCallback dependency list through their whole closure chain.
+  const onNodePointerDownRef = useRef(onNodePointerDown)
+  onNodePointerDownRef.current = onNodePointerDown
+  const stableOnNodePointerDown = useCallback((id: string, e: ReactPointerEvent) => {
+    onNodePointerDownRef.current(id, e)
+  }, [])
+  const onNodeDoubleClickRef = useRef(onNodeDoubleClick)
+  onNodeDoubleClickRef.current = onNodeDoubleClick
+  const stableOnNodeDoubleClick = useCallback((id: string, e: ReactMouseEvent) => {
+    onNodeDoubleClickRef.current(id, e)
+  }, [])
 
   const onBackgroundDown = (e: ReactPointerEvent) => {
     // Kill any stray DOM text selection (SVG <text> is otherwise selectable while dragging).
@@ -564,10 +673,23 @@ export function Artboard() {
       const local = toLocal(e)
       const dx = local.x - moveDrag.current.startLocalX
       const dy = local.y - moveDrag.current.startLocalY
-      moveSelectedTo(
-        moveDrag.current.originBox.x + dx,
-        moveDrag.current.originBox.y + dy,
+      const { originBox, others } = moveDrag.current
+      // Live preview only — snap and show the offset via transform, don't
+      // touch the document. Mutating every selected node's geometry (and
+      // re-diffing it) on every pointermove is what makes dragging a large
+      // group unusable; the real move is committed once on pointer up.
+      const snapped = snapBBox(
+        { ...originBox, x: originBox.x + dx, y: originBox.y + dy },
+        others,
+        doc.artboards,
+        doc.settings,
+        doc.manualGuides,
       )
+      setDragOffset({
+        dx: snapped.x - originBox.x,
+        dy: snapped.y - originBox.y,
+      })
+      setGuides(snapped.guides)
       return
     }
 
@@ -648,8 +770,20 @@ export function Artboard() {
     }
 
     if (moveDrag.current) {
+      const { originBox, others } = moveDrag.current
+      const local = toLocal(e)
+      const dx = local.x - moveDrag.current.startLocalX
+      const dy = local.y - moveDrag.current.startLocalY
       moveDrag.current = null
+      setDragOffset(null)
       setGuides([])
+      // Single commit for the whole gesture — this is the only point the
+      // document (and every selected descendant's geometry) actually gets
+      // rewritten. Skip entirely for a plain click (no pointer movement) so
+      // selecting a large group doesn't pay the translate cost for nothing.
+      if (dx !== 0 || dy !== 0) {
+        moveSelectedTo(originBox.x + dx, originBox.y + dy, others, originBox)
+      }
       if (svgRef.current?.hasPointerCapture(e.pointerId)) {
         svgRef.current.releasePointerCapture(e.pointerId)
       }
@@ -681,7 +815,10 @@ export function Artboard() {
       if (!dragged) {
         if (!m.additive) clearSelection()
       } else {
-        const ids = idsInMarquee(doc, box, {
+        // Direct-mode marquee compares individual children's own absolute
+        // bboxes, which stay stale under an ancestor's unbaked move.
+        if (m.mode === 'direct') useDocStore.getState().flushGroupMoves()
+        const ids = idsInMarquee(useDocStore.getState().doc, box, {
           mode: m.mode,
         })
         if (m.additive) {
@@ -905,23 +1042,7 @@ export function Artboard() {
           if (tool === 'pen' && !penDrag.current) setPenCursor(null)
         }}
       >
-        <GradientDefs
-          doc={doc}
-          extra={
-            draftNode
-              ? [
-                  ...(draftNode.style.fill.type === 'linear' ||
-                  draftNode.style.fill.type === 'radial'
-                    ? [{ id: `fill-${draftNode.id}`, paint: draftNode.style.fill }]
-                    : []),
-                  ...(draftNode.style.stroke.type === 'linear' ||
-                  draftNode.style.stroke.type === 'radial'
-                    ? [{ id: `stroke-${draftNode.id}`, paint: draftNode.style.stroke }]
-                    : []),
-                ]
-              : undefined
-          }
-        />
+        <GradientDefs doc={doc} extra={gradientExtra} />
         <defs>
           <filter
             id="artboard-frame-shadow"
@@ -964,27 +1085,24 @@ export function Artboard() {
             />
           </g>
         ))}
-        <g pointerEvents={isCreateTool(tool) || handMode ? 'none' : 'auto'}>
-          {doc.zOrder.map((id) => {
-            const node = doc.nodes[id]
-            if (!node) return null
-            return (
-              <NodeView
-                key={id}
-                node={node}
-                doc={doc}
-                onPointerDown={onNodePointerDown}
-                onDoubleClick={onNodeDoubleClick}
-                editingTextId={editingTextId}
-                liveEditText={liveEditText}
-              />
-            )
-          })}
-        </g>
+        <NodeList
+          doc={doc}
+          tool={tool}
+          handMode={handMode}
+          outlineMode={outlineMode}
+          onPointerDown={stableOnNodePointerDown}
+          onDoubleClick={stableOnNodeDoubleClick}
+          editingTextId={editingTextId}
+          liveEditText={liveEditText}
+          selectedIds={selectedIds}
+          dragOffset={dragOffset}
+        />
         {draftNode && (
           <NodeView
             node={draftNode}
             doc={doc}
+            outlineMode={outlineMode}
+            tool={tool}
             onPointerDown={() => undefined}
           />
         )}

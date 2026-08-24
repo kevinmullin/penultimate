@@ -76,10 +76,15 @@ function groupBBox(group: GroupNode, doc: VectorDocument): BBox {
     .map((id) => doc.nodes[id])
     .filter(Boolean)
     .map((n) => nodeBBox(n, doc))
-  if (boxes.length === 0) {
-    return { x: group.x, y: group.y, width: 1, height: 1 }
-  }
-  return unionBoxes(boxes)
+  const box =
+    boxes.length === 0
+      ? { x: group.x, y: group.y, width: 1, height: 1 }
+      : unionBoxes(boxes)
+  // Children still hold their pre-move coordinates until something bakes
+  // this — see `GroupNode.pendingMove` — so offset the reported box to
+  // match what's actually on screen.
+  const move = group.pendingMove
+  return move ? { ...box, x: box.x + move.dx, y: box.y + move.dy } : box
 }
 
 export function unionBoxes(boxes: BBox[]): BBox {
@@ -199,6 +204,37 @@ export function translateNode(node: VecNode, dx: number, dy: number): VecNode {
   }
 }
 
+/**
+ * Bake a group's unbaked move (see `GroupNode.pendingMove`) into every
+ * child's real coordinates, then clear it — reproducing exactly what used
+ * to happen eagerly on every move commit. No-op if the node isn't a group
+ * or has no pending move. Anything that reads/writes a specific child's
+ * absolute geometry (resize, pathfinder, direct path edit, export, ...)
+ * must call this first.
+ */
+export function bakeGroupMove(doc: VectorDocument, groupId: string): VectorDocument {
+  const group = doc.nodes[groupId]
+  if (!group || group.type !== 'group' || !group.pendingMove) return doc
+  const { dx, dy } = group.pendingMove
+  const nodes = { ...doc.nodes }
+  nodes[groupId] = { ...group, pendingMove: undefined }
+  for (const childId of group.children) {
+    const child = nodes[childId]
+    if (child) nodes[childId] = translateNode(child, dx, dy)
+  }
+  return { ...doc, nodes }
+}
+
+/** Bake every top-level group's pending move — for operations that touch the whole document (export, flush-before-save). */
+export function bakeAllPendingMoves(doc: VectorDocument): VectorDocument {
+  let next = doc
+  for (const id of doc.zOrder) {
+    const n = next.nodes[id]
+    if (n?.type === 'group' && n.pendingMove) next = bakeGroupMove(next, id)
+  }
+  return next
+}
+
 export function scaleNodeFromBox(
   node: VecNode,
   oldBox: BBox,
@@ -274,6 +310,21 @@ export function parentOf(id: string, doc: VectorDocument): string | null {
     if (n.type === 'group' && n.children.includes(id)) return n.id
   }
   return null
+}
+
+/**
+ * O(1)-lookup version of `parentOf` for hot paths (e.g. per-pointermove
+ * during a drag) — `parentOf` itself is O(n) per call and shouldn't be
+ * called in a loop over many nodes. Build once per gesture, not per event.
+ */
+export function buildParentIndex(doc: VectorDocument): Map<string, string> {
+  const index = new Map<string, string>()
+  for (const n of Object.values(doc.nodes)) {
+    if (n.type === 'group') {
+      for (const childId of n.children) index.set(childId, n.id)
+    }
+  }
+  return index
 }
 
 export function topLevelIds(doc: VectorDocument): string[] {

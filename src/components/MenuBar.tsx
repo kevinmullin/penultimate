@@ -3,6 +3,7 @@ import { documentToPngBlob, downloadBlob } from '../io/exportPng'
 import { documentToSvg, downloadText } from '../io/exportSvg'
 import { importSvgIntoDocument, openSvgFile } from '../io/importSvg'
 import { openProject, openRasterFile, saveProject } from '../io/projectFile'
+import { bakeAllPendingMoves } from '../geometry'
 import { useDocStore } from '../store/documentStore'
 import { useUiTheme } from '../hooks/useUiTheme'
 import { defaultStyle, nextId } from '../store/documentStore'
@@ -112,7 +113,7 @@ export function MenuBar() {
           icon="export-svg"
           label="Export SVG"
           onClick={() => {
-            const svg = documentToSvg(doc)
+            const svg = documentToSvg(bakeAllPendingMoves(doc))
             const safe = (doc.name || 'artboard').replace(/[^\w\-]+/g, '_')
             downloadText(svg, `${safe}.svg`, 'image/svg+xml')
           }}
@@ -122,7 +123,7 @@ export function MenuBar() {
           label="Export PNG"
           primary
           onClick={() =>
-            void documentToPngBlob(doc).then((blob) => {
+            void documentToPngBlob(bakeAllPendingMoves(doc)).then((blob) => {
               const safe = (doc.name || 'artboard').replace(/[^\w\-]+/g, '_')
               downloadBlob(blob, `${safe}.png`)
             })

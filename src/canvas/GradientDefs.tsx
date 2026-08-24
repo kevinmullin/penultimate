@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import type { VecNode, VectorDocument } from '../types'
 import { paintNeedsDef, type Paint } from '../style/paint'
 
@@ -48,7 +49,7 @@ function collectFromNode(node: VecNode, out: Array<{ id: string; paint: Paint }>
   }
 }
 
-export function GradientDefs({
+export const GradientDefs = memo(function GradientDefs({
   doc,
   extra,
 }: {
@@ -69,4 +70,4 @@ export function GradientDefs({
       ))}
     </defs>
   )
-}
+})

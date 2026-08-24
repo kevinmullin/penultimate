@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
-import { nodeBBox, parentOf, selectionBBox } from '../geometry'
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { buildParentIndex, nodeBBox, selectionBBox } from '../geometry'
 import { useDocStore } from '../store/documentStore'
-import { snapResizeBBox } from './snap'
+import { snapBBox, snapResizeBBox } from './snap'
 import { isCreateTool } from './NodeViews'
+import type { BBox } from '../types'
 
 type Handle = 'nw' | 'ne' | 'sw' | 'se' | 'n' | 'e' | 's' | 'w' | 'rotate'
 
@@ -14,6 +15,11 @@ type DragState = {
   originRotation: number
   startPointerAngle: number
   svg: SVGSVGElement
+  /** Other nodes' bboxes, cached at drag-start (see geometry.ts buildParentIndex). */
+  others: BBox[]
+  /** Latest snapped translate offset for a 'move' drag — committed once on pointer up. */
+  moveDx: number
+  moveDy: number
 }
 
 function svgLocalFromClient(
@@ -68,6 +74,8 @@ export function SelectionOverlay({
   const resizeSelectionTo = useDocStore((s) => s.resizeSelectionTo)
   const rotateSelected = useDocStore((s) => s.rotateSelected)
   const setGuides = useDocStore((s) => s.setGuides)
+  const dragOffset = useDocStore((s) => s.dragOffset)
+  const setDragOffset = useDocStore((s) => s.setDragOffset)
 
   const drag = useRef<DragState | null>(null)
   const aspectLockRef = useRef(aspectLock)
@@ -80,6 +88,11 @@ export function SelectionOverlay({
   // Delay hit-testing so a double-click to edit text isn't eaten by the
   // selection chrome that mounts after the first click.
   const [interactive, setInteractive] = useState(false)
+
+  // Memoized: unioning a large group's children is real work, and doc only
+  // changes reference on actual mutations (post NodeView/PaintedShape memo
+  // fix), so this now only recomputes on real selection/doc changes.
+  const box = useMemo(() => selectionBBox(selectedIds, doc), [selectedIds, doc])
 
   useEffect(() => {
     setInteractive(false)
@@ -97,7 +110,21 @@ export function SelectionOverlay({
       const dy = local.y - d.startLocalY
 
       if (d.kind === 'move') {
-        moveSelectedTo(d.originBox.x + dx, d.originBox.y + dy)
+        // Live preview only (see NodeList in Artboard.tsx) — snap and show
+        // the offset via transform without mutating every selected node's
+        // geometry on each pointermove. Committed once on pointer up.
+        const liveDoc = useDocStore.getState().doc
+        const snapped = snapBBox(
+          { ...d.originBox, x: d.originBox.x + dx, y: d.originBox.y + dy },
+          d.others,
+          liveDoc.artboards,
+          liveDoc.settings,
+          liveDoc.manualGuides,
+        )
+        d.moveDx = snapped.x - d.originBox.x
+        d.moveDy = snapped.y - d.originBox.y
+        setDragOffset({ dx: d.moveDx, dy: d.moveDy })
+        setGuides(snapped.guides)
         return
       }
 
@@ -152,17 +179,8 @@ export function SelectionOverlay({
         top: kind.includes('n'),
         bottom: kind.includes('s'),
       }
-      const state = useDocStore.getState()
-      const liveDoc = state.doc
-      const liveSelected = state.selectedIds
-      const others = Object.values(liveDoc.nodes)
-        .filter(
-          (n) =>
-            n.visible &&
-            !liveSelected.includes(n.id) &&
-            !parentOf(n.id, liveDoc),
-        )
-        .map((n) => nodeBBox(n, liveDoc))
+      const liveDoc = useDocStore.getState().doc
+      const others = d.others
       const snapped = snapResizeBBox(
         { x, y, width, height },
         edges,
@@ -197,11 +215,24 @@ export function SelectionOverlay({
     }
 
     const onUp = () => {
-      if (!drag.current) return
+      const d = drag.current
+      if (!d) return
       drag.current = null
       setRotatePointer(null)
       setRotating(false)
       setGuides([])
+      if (d.kind === 'move') {
+        setDragOffset(null)
+        // Single commit for the whole gesture (see onMove's 'move' branch).
+        if (d.moveDx !== 0 || d.moveDy !== 0) {
+          moveSelectedTo(
+            d.originBox.x + d.moveDx,
+            d.originBox.y + d.moveDy,
+            d.others,
+            d.originBox,
+          )
+        }
+      }
     }
 
     window.addEventListener('pointermove', onMove)
@@ -212,7 +243,7 @@ export function SelectionOverlay({
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onUp)
     }
-  }, [moveSelectedTo, resizeSelectionTo, rotateSelected, setGuides])
+  }, [moveSelectedTo, resizeSelectionTo, rotateSelected, setGuides, setDragOffset])
 
   if (selectedIds.length === 0) return null
   // Keep bounds visible after create / Type so Appearance still has a clear target
@@ -221,8 +252,14 @@ export function SelectionOverlay({
   if (tool !== 'select' && tool !== 'text' && tool !== 'area-text' && !isCreateTool(tool)) {
     return null
   }
-  const box = selectionBBox(selectedIds, doc)
   if (!box) return null
+
+  // Visual-only position during a live move drag — `box` itself stays put
+  // (the document isn't mutated until pointer up) so the chrome tracks the
+  // same transform preview NodeList applies to the selected shapes.
+  const renderBox = dragOffset
+    ? { ...box, x: box.x + dragOffset.dx, y: box.y + dragOffset.dy }
+    : box
 
   const hs = 8 / scale
   const stroke = 1.5 / scale
@@ -230,10 +267,10 @@ export function SelectionOverlay({
 
   const selected = selectedIds.map((id) => doc.nodes[id]).filter(Boolean)
   const rotation = selected.length === 1 ? selected[0].rotation : 0
-  const cx = box.x + box.width / 2
-  const cy = box.y + box.height / 2
-  const topCenter = rotatePoint(cx, box.y, cx, cy, rotation)
-  const restHandle = rotatePoint(cx, box.y - stem, cx, cy, rotation)
+  const cx = renderBox.x + renderBox.width / 2
+  const cy = renderBox.y + renderBox.height / 2
+  const topCenter = rotatePoint(cx, renderBox.y, cx, cy, rotation)
+  const restHandle = rotatePoint(cx, renderBox.y - stem, cx, cy, rotation)
 
   const beginDrag = (
     kind: 'move' | Handle,
@@ -248,6 +285,12 @@ export function SelectionOverlay({
     pushHistory()
     const local = svgLocalFromClient(e.clientX, e.clientY, svg)
     if (!local) return
+    const liveDoc = useDocStore.getState().doc
+    const liveSelected = useDocStore.getState().selectedIds
+    const parentIndex = buildParentIndex(liveDoc)
+    const others = Object.values(liveDoc.nodes)
+      .filter((n) => n.visible && !liveSelected.includes(n.id) && !parentIndex.has(n.id))
+      .map((n) => nodeBBox(n, liveDoc))
     drag.current = {
       kind,
       startLocalX: local.x,
@@ -256,6 +299,9 @@ export function SelectionOverlay({
       originRotation: rotation,
       startPointerAngle,
       svg,
+      others,
+      moveDx: 0,
+      moveDy: 0,
     }
     if (kind === 'rotate') {
       setRotating(true)
@@ -277,14 +323,29 @@ export function SelectionOverlay({
   }
 
   const handles: Array<{ kind: Handle; x: number; y: number; cursor: string }> = [
-    { kind: 'nw', x: box.x, y: box.y, cursor: 'nwse-resize' },
-    { kind: 'ne', x: box.x + box.width, y: box.y, cursor: 'nesw-resize' },
-    { kind: 'sw', x: box.x, y: box.y + box.height, cursor: 'nesw-resize' },
-    { kind: 'se', x: box.x + box.width, y: box.y + box.height, cursor: 'nwse-resize' },
-    { kind: 'n', x: box.x + box.width / 2, y: box.y, cursor: 'ns-resize' },
-    { kind: 's', x: box.x + box.width / 2, y: box.y + box.height, cursor: 'ns-resize' },
-    { kind: 'w', x: box.x, y: box.y + box.height / 2, cursor: 'ew-resize' },
-    { kind: 'e', x: box.x + box.width, y: box.y + box.height / 2, cursor: 'ew-resize' },
+    { kind: 'nw', x: renderBox.x, y: renderBox.y, cursor: 'nwse-resize' },
+    { kind: 'ne', x: renderBox.x + renderBox.width, y: renderBox.y, cursor: 'nesw-resize' },
+    { kind: 'sw', x: renderBox.x, y: renderBox.y + renderBox.height, cursor: 'nesw-resize' },
+    {
+      kind: 'se',
+      x: renderBox.x + renderBox.width,
+      y: renderBox.y + renderBox.height,
+      cursor: 'nwse-resize',
+    },
+    { kind: 'n', x: renderBox.x + renderBox.width / 2, y: renderBox.y, cursor: 'ns-resize' },
+    {
+      kind: 's',
+      x: renderBox.x + renderBox.width / 2,
+      y: renderBox.y + renderBox.height,
+      cursor: 'ns-resize',
+    },
+    { kind: 'w', x: renderBox.x, y: renderBox.y + renderBox.height / 2, cursor: 'ew-resize' },
+    {
+      kind: 'e',
+      x: renderBox.x + renderBox.width,
+      y: renderBox.y + renderBox.height / 2,
+      cursor: 'ew-resize',
+    },
   ]
 
   const handlePos = rotating && rotatePointer ? rotatePointer : restHandle
@@ -302,10 +363,10 @@ export function SelectionOverlay({
       <g transform={`rotate(${rotation} ${cx} ${cy})`}>
         <rect
           className="sel-move"
-          x={box.x}
-          y={box.y}
-          width={box.width}
-          height={box.height}
+          x={renderBox.x}
+          y={renderBox.y}
+          width={renderBox.width}
+          height={renderBox.height}
           fill="transparent"
           stroke="#c4a484"
           strokeWidth={stroke}
