@@ -1366,6 +1366,7 @@ export const useDocStore = create<DocState>((set, get) => ({
       future: [],
       tool: 'select',
       editingTextId: null,
+      svgTraceNodeId: null,
     }),
 
   getDocument: () => get().doc,
