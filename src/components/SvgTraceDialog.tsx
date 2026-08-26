@@ -11,13 +11,18 @@ import { createPortal } from 'react-dom'
 import { useDocStore } from '../store/documentStore'
 import { useTitleBarDrag } from '../hooks/useTitleBarDrag'
 import { rgbToHex } from '../color/colorMath'
+import { BG_REMOVAL_MODELS, type BgRemovalModel } from '../image/bgRemovalModels'
+import { compositeForegroundMask, type ForegroundMask } from '../image/maskComposite'
 import {
+  buildAlphaSilhouette,
   buildPlacementMatrix,
   buildPreviewSvg,
   buildVtracerOptions,
+  combineForegroundClipD,
   decodeImageData,
   defaultTraceUiOptions,
   parseTracedSvg,
+  silhouetteVtracerOptions,
   SvgTraceWorkerClient,
   transformPathD,
   type TraceUiOptions,
@@ -100,7 +105,6 @@ export function SvgTraceDialog() {
   const uiRef = useRef(ui)
   uiRef.current = ui
 
-  const [ready, setReady] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [svgPreview, setSvgPreview] = useState<string | null>(null)
@@ -109,9 +113,28 @@ export function SvgTraceDialog() {
   const [reveal, setReveal] = useState(50)
   const compareRef = useRef<HTMLDivElement>(null)
 
+  const [removeBg, setRemoveBg] = useState(false)
+  const [bgModel, setBgModel] = useState<BgRemovalModel>('isnet_quint8')
+  /** Mask cutoff/softness, as percentages of the 0-255 raw mask range (see maskComposite.ts). */
+  const [threshold, setThreshold] = useState(20)
+  const [feather, setFeather] = useState(15)
+  const [maskBusy, setMaskBusy] = useState(false)
+  const [maskProgress, setMaskProgress] = useState<number | null>(null)
+  const [maskError, setMaskError] = useState<string | null>(null)
+  const [maskReady, setMaskReady] = useState(false)
+  const maskRef = useRef<ForegroundMask | null>(null)
+
+  const [baseDecoded, setBaseDecoded] = useState(0)
+  const baseImageDataRef = useRef<ImageData | null>(null)
+
   const clientRef = useRef<SvgTraceWorkerClient | null>(null)
   const naturalSizeRef = useRef<{ w: number; h: number } | null>(null)
   const latestRequestId = useRef(0)
+
+  /** Raw (untransformed) clip path tracing out the alpha silhouette — see `buildAlphaSilhouette`. */
+  const [clipD, setClipD] = useState<string | null>(null)
+  const maskClientRef = useRef<SvgTraceWorkerClient | null>(null)
+  const latestMaskRequestId = useRef(0)
 
   const node = nodeId ? doc.nodes[nodeId] : null
   const imageNode = node && node.type === 'image' ? node : null
@@ -121,8 +144,58 @@ export function SvgTraceDialog() {
     if (!nodeId) return
     setUi(defaultTraceUiOptions())
     setReveal(50)
+    setClipD(null)
     reset(null)
+    setRemoveBg(false)
+    setBgModel('isnet_quint8')
+    setThreshold(20)
+    setFeather(15)
+    setMaskBusy(false)
+    setMaskProgress(null)
+    setMaskError(null)
+    setMaskReady(false)
+    maskRef.current = null
   }, [nodeId, reset])
+
+  // Invalidate the cached mask whenever the model choice changes, so the
+  // segmentation effect below re-runs inference with the newly picked tier.
+  useEffect(() => {
+    maskRef.current = null
+    setMaskReady(false)
+  }, [bgModel])
+
+  // Run segmentation (once per node+model, cached in maskRef) when the toggle is switched on.
+  // Only the mask is computed here — compositing it against threshold/feather happens
+  // separately below so dragging those sliders never re-runs inference.
+  useEffect(() => {
+    if (!nodeId || !imageNode || !removeBg || maskRef.current) return
+    let cancelled = false
+    setMaskBusy(true)
+    setMaskProgress(null)
+    setMaskError(null)
+    import('../image/backgroundRemoval')
+      .then(({ computeForegroundMask }) =>
+        computeForegroundMask(imageNode.href, bgModel, (fraction) => {
+          if (!cancelled) setMaskProgress(fraction)
+        }),
+      )
+      .then((mask) => {
+        if (cancelled) return
+        maskRef.current = mask
+        setMaskReady(true)
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        setMaskError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => {
+        if (!cancelled) setMaskBusy(false)
+      })
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId, removeBg, bgModel])
 
   const updateRevealFromClientX = useCallback((clientX: number) => {
     const el = compareRef.current
@@ -145,31 +218,32 @@ export function SvgTraceDialog() {
     window.addEventListener('pointerup', onUp)
   }
 
-  // Decode the source raster and hand it to a fresh worker for this session.
+  // Decode the source raster (always the original — background removal is
+  // applied as a separate compositing pass below) and hand a fresh worker
+  // its pixels for this session.
   useEffect(() => {
     if (!nodeId) return
     const src = useDocStore.getState().doc.nodes[nodeId]
     if (!src || src.type !== 'image') return
 
     let cancelled = false
-    setReady(false)
     setBusy(true)
     setError(null)
     setSvgPreview(null)
     naturalSizeRef.current = null
+    baseImageDataRef.current = null
 
     const client = new SvgTraceWorkerClient()
     clientRef.current = client
+    const maskClient = new SvgTraceWorkerClient()
+    maskClientRef.current = maskClient
 
     decodeImageData(src.href)
       .then(({ imageData, naturalWidth, naturalHeight }) => {
         if (cancelled) return
         naturalSizeRef.current = { w: naturalWidth, h: naturalHeight }
-        return client.load(imageData)
-      })
-      .then(() => {
-        if (cancelled) return
-        setReady(true)
+        baseImageDataRef.current = imageData
+        setBaseDecoded((v) => v + 1)
       })
       .catch((err: unknown) => {
         if (cancelled) return
@@ -181,6 +255,8 @@ export function SvgTraceDialog() {
       cancelled = true
       client.destroy()
       clientRef.current = null
+      maskClient.destroy()
+      maskClientRef.current = null
     }
   }, [nodeId])
 
@@ -204,12 +280,75 @@ export function SvgTraceDialog() {
       })
   }, [])
 
-  // Debounced (re)trace whenever the worker is ready or options change.
+  // (Re)load the worker with the effective pixels — original or mask-composited
+  // — then retrace. Debounced so slider drags (trace options, or mask
+  // threshold/feather once removeBg is on) don't spam the worker.
   useEffect(() => {
-    if (!ready) return
-    const t = window.setTimeout(runTrace, TRACE_DEBOUNCE_MS)
+    const client = clientRef.current
+    const base = baseImageDataRef.current
+    if (!client || !base) return
+    if (removeBg && !maskRef.current) return
+
+    const t = window.setTimeout(() => {
+      const mask = maskRef.current
+      const imageData =
+        removeBg && mask
+          ? compositeForegroundMask(base, mask, (threshold / 100) * 255, (feather / 100) * 255)
+          : base
+      setBusy(true)
+      setError(null)
+      client
+        .load(imageData)
+        .then(runTrace)
+        .catch((err: unknown) => {
+          setBusy(false)
+          setError(err instanceof Error ? err.message : String(err))
+        })
+    }, TRACE_DEBOUNCE_MS)
     return () => window.clearTimeout(t)
-  }, [ui, ready, runTrace])
+  }, [nodeId, ui, removeBg, threshold, feather, maskReady, baseDecoded, runTrace])
+
+  // Trace a hard silhouette of the alpha channel and cache it as a clip
+  // path, so `apply()` can clip the traced result — vtracer's bw/watershed
+  // frontends ignore alpha (unlike color-cluster, which discards the
+  // transparent region itself), so without this the removed background
+  // reappears as real shapes in those two modes. Decoupled from the main
+  // trace effect above: this only needs to rerun when the alpha mask itself
+  // changes, not on unrelated color/shape slider drags.
+  useEffect(() => {
+    const maskClient = maskClientRef.current
+    const base = baseImageDataRef.current
+    if (!maskClient || !base) return
+    if (!removeBg || !maskRef.current) {
+      setClipD(null)
+      return
+    }
+    const mask = maskRef.current
+    const t = window.setTimeout(() => {
+      const imageData = compositeForegroundMask(
+        base,
+        mask,
+        (threshold / 100) * 255,
+        (feather / 100) * 255,
+      )
+      const silhouette = buildAlphaSilhouette(imageData)
+      maskClient
+        .load(silhouette)
+        .then(() => {
+          const { requestId, result } = maskClient.trace(
+            silhouetteVtracerOptions(ui.filterSpeckle, ui.pathPrecision),
+          )
+          latestMaskRequestId.current = requestId
+          return result.then((svg) => {
+            if (latestMaskRequestId.current !== requestId) return
+            setClipD(combineForegroundClipD(svg))
+          })
+        })
+        .catch(() => setClipD(null))
+    }, TRACE_DEBOUNCE_MS)
+    return () => window.clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId, removeBg, threshold, feather, maskReady, baseDecoded, ui.filterSpeckle, ui.pathPrecision])
 
   // Blob URL for the preview <img> — avoids dangerouslySetInnerHTML. Goes
   // through buildPreviewSvg so what's shown here (including the stroke
@@ -267,13 +406,14 @@ export function SvgTraceDialog() {
         opacity: p.opacity,
       }
     })
-    commitSvgTrace(imageNode.id, paths)
+    const clip = removeBg && clipD ? { d: transformPathD(clipD, xform) } : undefined
+    commitSvgTrace(imageNode.id, paths, clip)
     close()
   }
 
   if (!nodeId || !imageNode) return null
 
-  const canApply = !busy && !error && Boolean(svgPreview) && pathCount > 0
+  const canApply = !busy && !maskBusy && !error && Boolean(svgPreview) && pathCount > 0
 
   return createPortal(
     <div
@@ -301,6 +441,65 @@ export function SvgTraceDialog() {
 
         <div className="settings-modal__body svg-trace-modal__body">
           <div className="svg-trace-modal__controls">
+            <div className="svg-trace-modal__group">
+              <h3 className="svg-trace-modal__group-title">Background</h3>
+              <label className="svg-trace-modal__checkbox">
+                <input
+                  type="checkbox"
+                  checked={removeBg}
+                  disabled={maskBusy}
+                  onChange={(e) => setRemoveBg(e.target.checked)}
+                />
+                <span>Remove background</span>
+              </label>
+              {removeBg && (
+                <label className="field-inline">
+                  <span>Model</span>
+                  <select
+                    value={bgModel}
+                    disabled={maskBusy}
+                    onChange={(e) => setBgModel(e.target.value as BgRemovalModel)}
+                  >
+                    {BG_REMOVAL_MODELS.map((m) => (
+                      <option key={m.value} value={m.value}>
+                        {m.label} — {m.description}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {maskBusy && (
+                <div className="svg-trace-modal__status">
+                  Removing background…
+                  {maskProgress !== null ? ` ${Math.round(maskProgress * 100)}%` : ''}
+                  {maskProgress === null ? ' (downloading model, first use only)' : ''}
+                </div>
+              )}
+              {maskError && <div className="svg-trace-modal__status--error">{maskError}</div>}
+              {removeBg && !maskBusy && !maskError && (
+                <>
+                  <TraceSlider
+                    label="Cutoff"
+                    value={threshold}
+                    min={0}
+                    max={100}
+                    step={1}
+                    format={(v) => `${v}%`}
+                    onChange={setThreshold}
+                  />
+                  <TraceSlider
+                    label="Softness"
+                    value={feather}
+                    min={0}
+                    max={100}
+                    step={1}
+                    format={(v) => `${v}%`}
+                    onChange={setFeather}
+                  />
+                </>
+              )}
+            </div>
+
             <div className="svg-trace-modal__group">
               <h3 className="svg-trace-modal__group-title">Color</h3>
               <label className="field-inline">
@@ -550,6 +749,7 @@ export function SvgTraceDialog() {
                   src={imageNode.href}
                   alt="Original"
                   draggable={false}
+                  style={{ clipPath: `inset(0 0 0 ${reveal}%)` }}
                 />
                 <div
                   className="svg-trace-compare__overlay"

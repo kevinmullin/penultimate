@@ -135,6 +135,53 @@ export function buildVtracerOptions(ui: TraceUiOptions): VtracerOptions {
   }
 }
 
+/**
+ * Builds a hard black/white silhouette from an alpha channel (opaque →
+ * black, transparent → white), traced separately with `silhouetteVtracerOptions`
+ * to clip background-removed results. Needed because vtracer's `bw` and
+ * `watershed` frontends never look at alpha (only `color-cluster` discards
+ * the transparent region itself, via its key-color pass) — without this,
+ * whatever was behind the removed background gets traced as real shapes in
+ * those two modes.
+ */
+export function buildAlphaSilhouette(imageData: ImageData): ImageData {
+  const { width, height, data } = imageData
+  const out = new ImageData(width, height)
+  for (let i = 0; i < width * height; i++) {
+    const v = data[i * 4 + 3]! >= 128 ? 0 : 255
+    const o = i * 4
+    out.data[o] = v
+    out.data[o + 1] = v
+    out.data[o + 2] = v
+    out.data[o + 3] = 255
+  }
+  return out
+}
+
+/** Fixed bw options for tracing the alpha silhouette — not user-tunable. */
+export function silhouetteVtracerOptions(filterSpeckle: number, pathPrecision: number): VtracerOptions {
+  return {
+    mode: 'spline',
+    hierarchical: 'stacked',
+    clustering: 'bw',
+    binaryThreshold: 128,
+    filterSpeckle,
+    cornerThreshold: 60,
+    lengthThreshold: 4,
+    maxIterations: 10,
+    spliceThreshold: 45,
+    pathPrecision,
+    optimize: 0,
+  }
+}
+
+/** Combines the traced silhouette's foreground (black) subpaths into one `d`, for use as a single clip-path node. */
+export function combineForegroundClipD(svg: string): string | null {
+  const paths = parseTracedSvg(svg).filter((p) => p.r < 128 && p.g < 128 && p.b < 128)
+  if (paths.length === 0) return null
+  return paths.map((p) => p.d).join(' ')
+}
+
 type WorkerOutMsg =
   | { type: 'loaded'; requestId: number }
   | { type: 'result'; requestId: number; svg: string }

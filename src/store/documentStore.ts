@@ -141,6 +141,7 @@ type DocState = {
       strokeWidth: number
       opacity: number
     }>,
+    clip?: { d: string },
   ) => void
   setEditingTextId: (id: string | null) => void
   setAutosaveAt: (at: number | null) => void
@@ -353,7 +354,7 @@ export const useDocStore = create<DocState>((set, get) => ({
   setShapeDialog: (shapeDialog) => set({ shapeDialog }),
   setSvgTraceNodeId: (svgTraceNodeId) => set({ svgTraceNodeId }),
 
-  commitSvgTrace: (imageNodeId, paths) => {
+  commitSvgTrace: (imageNodeId, paths, clip) => {
     const { doc } = get()
     const imageNode = doc.nodes[imageNodeId]
     if (!imageNode || imageNode.type !== 'image' || paths.length === 0) return
@@ -386,6 +387,26 @@ export const useDocStore = create<DocState>((set, get) => ({
 
     const box = unionBoxes(pathIds.map((id) => pathBBox((nodes[id] as PathNode).d)))
     const groupId = nextId('group')
+
+    let children = pathIds
+    let clipped: true | undefined
+    if (clip) {
+      const clipId = nextId('path')
+      const clipNode: PathNode = normalizeNode({
+        id: clipId,
+        type: 'path',
+        name: 'Background Clip',
+        visible: false,
+        locked: false,
+        rotation: 0,
+        style: defaultStyle(),
+        d: clip.d,
+      }) as PathNode
+      nodes[clipId] = clipNode
+      children = [clipId, ...pathIds]
+      clipped = true
+    }
+
     const group: GroupNode = {
       id: groupId,
       type: 'group',
@@ -394,9 +415,10 @@ export const useDocStore = create<DocState>((set, get) => ({
       locked: false,
       rotation: 0,
       style: defaultStyle(),
-      children: pathIds,
+      children,
       x: box.x,
       y: box.y,
+      clipped,
     }
     nodes[groupId] = group
     nodes[imageNodeId] = { ...imageNode, visible: false }

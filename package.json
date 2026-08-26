@@ -11,6 +11,7 @@
     "sync:readme": "node tools/sync_readme_features.js"
   },
   "dependencies": {
+    "@imgly/background-removal": "^1.7.0",
     "paper": "^0.12.18",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
